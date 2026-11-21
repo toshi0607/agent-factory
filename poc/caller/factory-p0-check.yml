@@ -1,0 +1,30 @@
+name: Check Agent Factory P0
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        type: choice
+        required: true
+        options:
+          - sm-create-get
+          - sm-list-delete
+          - sm-versions
+          - tasks-queues
+          - pubsub-topics
+      patch_base64:
+        description: Base64-encoded patch (blank checks the baseline)
+        type: string
+
+permissions: {}
+
+jobs:
+  check:
+    permissions:
+      contents: read
+    # Replace both FACTORY_SHA placeholders with the same factory commit SHA.
+    uses: toshi0607/agent-factory/.github/workflows/p0-check-only.yml@FACTORY_SHA
+    with:
+      factory_ref: FACTORY_SHA
+      task: ${{ inputs.task }}
+      patch_base64: ${{ inputs.patch_base64 }}

@@ -1,0 +1,48 @@
+name: Run Agent Factory P0
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        type: choice
+        required: true
+        options:
+          - sm-create-get
+          - sm-list-delete
+          - sm-versions
+          - tasks-queues
+          - pubsub-topics
+          - conditions-probe
+      role:
+        type: choice
+        required: true
+        default: fixer
+        options:
+          - fixer
+          - probe
+      budget_cents:
+        description: LLM budget in USD cents (blank uses the policy)
+        type: string
+      minutes:
+        description: Time limit in minutes (blank uses the policy)
+        type: string
+
+permissions: {}
+
+jobs:
+  run:
+    permissions:
+      id-token: write
+      contents: read
+    # Replace both FACTORY_SHA placeholders with the same factory commit SHA.
+    uses: toshi0607/agent-factory/.github/workflows/p0-run.yml@FACTORY_SHA
+    with:
+      factory_ref: FACTORY_SHA
+      task: ${{ inputs.task }}
+      role: ${{ inputs.role }}
+      budget_cents: ${{ inputs.budget_cents }}
+      minutes: ${{ inputs.minutes }}
+      federation_rule_id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+      organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+      service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}

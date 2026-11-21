@@ -1,0 +1,33 @@
+# P0 (PoC) subset of the policy file. Numbers are provisional.
+product:
+  repository: toshi0607/google-cloud-emulator
+  module: github.com/toshi0607/google-cloud-emulator
+toolchain:
+  go:
+    version: go1.26.11
+    filename: go1.26.11.linux-amd64.tar.gz
+    url: https://go.dev/dl/go1.26.11.linux-amd64.tar.gz
+    sha256: 9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec
+    size_bytes: 66999944
+egress:
+  gomod:
+    allowed_hosts:
+      - proxy.golang.org
+      - sum.golang.org
+roles:
+  fixer:
+    agent: claude
+    model: claude-opus-5-5
+    prompt: prompts/fixer.md
+    egress: [gomod]
+    budget:
+      llm_usd_cents: 300
+      minutes: 30
+  probe:
+    agent: claude
+    model: claude-haiku-5-5
+    prompt: prompts/probe.md
+    egress: [gomod]
+    budget:
+      llm_usd_cents: 100
+      minutes: 10

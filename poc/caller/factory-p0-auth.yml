@@ -1,0 +1,19 @@
+name: Check Agent Factory P0 federation
+
+on: workflow_dispatch
+
+permissions: {}
+
+jobs:
+  auth:
+    permissions:
+      id-token: write
+      contents: read
+    # Replace both FACTORY_SHA placeholders with the same factory commit SHA.
+    uses: toshi0607/agent-factory/.github/workflows/p0-auth-check.yml@FACTORY_SHA
+    with:
+      factory_ref: FACTORY_SHA
+      federation_rule_id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+      organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+      service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}

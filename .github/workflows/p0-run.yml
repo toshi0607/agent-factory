@@ -1,0 +1,418 @@
+name: P0 agent run
+
+on:
+  workflow_call:
+    inputs:
+      task:
+        type: string
+        required: true
+      role:
+        type: string
+        default: fixer
+      candidate:
+        type: string
+        default: managed-agents
+      factory_ref:
+        type: string
+        required: true
+      federation_rule_id:
+        type: string
+        required: true
+      organization_id:
+        type: string
+        required: true
+      service_account_id:
+        type: string
+        required: true
+      workspace_id:
+        type: string
+        required: true
+      budget_cents:
+        type: string
+        default: ''
+      minutes:
+        type: string
+        default: ''
+
+permissions: {}
+
+env:
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      runner_seconds: ${{ steps.prepare.outputs.runner_seconds }}
+    steps:
+      - name: Validate factory ref
+        shell: bash
+        env:
+          FACTORY_REF: ${{ inputs.factory_ref }}
+        run: |
+          if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'factory_ref must be a full lowercase commit SHA\n' >&2
+            exit 1
+          fi
+      - name: Start timer
+        run: printf 'P0_PREPARE_TIME=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: product
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: toshi0607/agent-factory
+          ref: ${{ inputs.factory_ref }}
+          path: factory
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.11'
+          check-latest: false
+          cache: false
+      - name: Build prepare CLI
+        working-directory: factory
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          go build -o "$RUNNER_TEMP/bin/prepare" ./cmd/prepare
+      - name: Prepare session inputs
+        id: prepare
+        working-directory: factory
+        env:
+          TASK: ${{ inputs.task }}
+          GOPROXY: https://proxy.golang.org
+          GOVCS: '*:off'
+        run: |
+          "$RUNNER_TEMP/bin/prepare" -policy policy/google-cloud-emulator.yaml \
+            -product ../product -task "$TASK" -out "$RUNNER_TEMP/files"
+          printf 'runner_seconds=%s\n' "$(( $(date +%s) - P0_PREPARE_TIME ))" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: p0-files
+          path: ${{ runner.temp }}/files
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: p0-product
+          path: |
+            ${{ runner.temp }}/files/product.tar.gz
+            ${{ runner.temp }}/files/manifest.json
+          if-no-files-found: error
+
+  start:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      runner_seconds: ${{ steps.start.outputs.runner_seconds }}
+    steps:
+      - name: Validate factory ref
+        shell: bash
+        env:
+          FACTORY_REF: ${{ inputs.factory_ref }}
+        run: |
+          if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'factory_ref must be a full lowercase commit SHA\n' >&2
+            exit 1
+          fi
+      - name: Start timer
+        run: printf 'P0_START_TIME=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: toshi0607/agent-factory
+          ref: ${{ inputs.factory_ref }}
+          path: factory
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.11'
+          check-latest: false
+          cache: false
+      - name: Build session CLI
+        working-directory: factory
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          go build -o "$RUNNER_TEMP/bin/session" ./cmd/session
+      - name: Set factory commit
+        run: |
+          factory_commit="$(git -C factory rev-parse HEAD)"
+          printf 'FACTORY_COMMIT=%s\n' "$factory_commit" >> "$GITHUB_ENV"
+      - name: Create input artifact directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          mkdir "$RUNNER_TEMP/artifacts/p0-files"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: p0-files
+          path: ${{ runner.temp }}/artifacts/p0-files
+      - name: Start Managed Agents session
+        id: start
+        working-directory: factory
+        shell: bash
+        env:
+          ROLE: ${{ inputs.role }}
+          CANDIDATE: ${{ inputs.candidate }}
+          BUDGET_CENTS: ${{ inputs.budget_cents }}
+          MINUTES: ${{ inputs.minutes }}
+          PREPARE_SECONDS: ${{ needs.prepare.outputs.runner_seconds }}
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation_rule_id }}
+          ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ inputs.service_account_id }}
+          ANTHROPIC_WORKSPACE_ID: ${{ inputs.workspace_id }}
+        run: |
+          if [[ ! "$PREPARE_SECONDS" =~ ^[0-9]+$ ]]; then
+            printf 'Invalid prepare runner time\n' >&2
+            exit 1
+          fi
+          args=()
+          if [[ -n "$BUDGET_CENTS" ]]; then
+            args+=(-budget-cents "$BUDGET_CENTS")
+          fi
+          if [[ -n "$MINUTES" ]]; then
+            args+=(-minutes "$MINUTES")
+          fi
+          "$RUNNER_TEMP/bin/session" start -policy policy/google-cloud-emulator.yaml \
+            -role "$ROLE" -candidate "$CANDIDATE" -files "$RUNNER_TEMP/artifacts/p0-files" \
+            -state "$RUNNER_TEMP/state.json" "${args[@]}"
+          printf 'runner_seconds=%s\n' "$(( $(date +%s) - P0_START_TIME + PREPARE_SECONDS ))" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: p0-state
+          path: ${{ runner.temp }}/state.json
+          if-no-files-found: ignore
+      - name: Clean up if start fails after creating a session
+        if: failure() || cancelled()
+        env:
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation_rule_id }}
+          ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ inputs.service_account_id }}
+          ANTHROPIC_WORKSPACE_ID: ${{ inputs.workspace_id }}
+        run: |
+          if [[ -f "$RUNNER_TEMP/state.json" ]]; then
+            "$RUNNER_TEMP/bin/session" cleanup -state "$RUNNER_TEMP/state.json"
+          fi
+
+  # If this job fails before the collect step, or the run is cancelled between
+  # start and collect, the session can keep running until its budget cap.
+  # Run factory-p0-recover with this run's ID in cleanup or collect mode.
+  collect:
+    needs: start
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation_rule_id }}
+      ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
+      ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ inputs.service_account_id }}
+      ANTHROPIC_WORKSPACE_ID: ${{ inputs.workspace_id }}
+    steps:
+      - name: Validate factory ref
+        shell: bash
+        env:
+          FACTORY_REF: ${{ inputs.factory_ref }}
+        run: |
+          if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'factory_ref must be a full lowercase commit SHA\n' >&2
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: toshi0607/agent-factory
+          ref: ${{ inputs.factory_ref }}
+          path: factory
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.11'
+          check-latest: false
+          cache: false
+      - name: Build session CLI
+        working-directory: factory
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          go build -o "$RUNNER_TEMP/bin/session" ./cmd/session
+      - name: Set factory commit
+        run: |
+          factory_commit="$(git -C factory rev-parse HEAD)"
+          printf 'FACTORY_COMMIT=%s\n' "$factory_commit" >> "$GITHUB_ENV"
+      - name: Create state artifact directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          mkdir "$RUNNER_TEMP/artifacts/p0-state"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: p0-state
+          path: ${{ runner.temp }}/artifacts/p0-state
+      - name: Validate state artifact
+        id: validate-state
+        run: |
+          shopt -s dotglob nullglob
+          entries=("$RUNNER_TEMP/artifacts/p0-state"/*)
+          state="$RUNNER_TEMP/artifacts/p0-state/state.json"
+          if [[ ${#entries[@]} -ne 1 || ! -f "$state" || -L "$state" ]]; then
+            printf 'Expected the p0-state artifact to contain only a regular state.json file\n' >&2
+            exit 1
+          fi
+          printf 'P0_STATE_PATH=%s\n' "$state" >> "$GITHUB_ENV"
+      - name: Collect session outputs
+        id: collect
+        run: |
+          "$RUNNER_TEMP/bin/session" collect -state "$P0_STATE_PATH" -out "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: p0-collected
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure() && steps.validate-state.outcome == 'success'
+        with:
+          name: p0-state-after-collect
+          path: ${{ runner.temp }}/artifacts/p0-state/state.json
+          if-no-files-found: warn
+      - name: Clean up session
+        if: always() && steps.collect.outcome != 'success' && steps.collect.outcome != 'failure'
+        run: |
+          if [[ ! -x "$RUNNER_TEMP/bin/session" || ! -f "${P0_STATE_PATH:-}" ]]; then
+            printf '%s\n' "Session binary or state unavailable. Run the \"factory-p0-recover\" workflow with this run's id to clean up."
+            exit 0
+          fi
+          "$RUNNER_TEMP/bin/session" cleanup -state "$P0_STATE_PATH"
+
+  check:
+    needs: [start, collect]
+    if: inputs.role == 'fixer'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions: {}
+    env:
+      CHECK_IMAGE: golang:1.26.11-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0
+    steps:
+      - name: Validate factory ref
+        shell: bash
+        env:
+          FACTORY_REF: ${{ inputs.factory_ref }}
+        run: |
+          if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'factory_ref must be a full lowercase commit SHA\n' >&2
+            exit 1
+          fi
+      - name: Start timer
+        run: printf 'P0_CHECK_TIME=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: toshi0607/agent-factory
+          ref: ${{ inputs.factory_ref }}
+          path: factory
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.11'
+          check-latest: false
+          cache: false
+      - name: Build factory CLIs
+        working-directory: factory
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          go build -o "$RUNNER_TEMP/bin/p0check" ./cmd/p0check
+          go build -o "$RUNNER_TEMP/bin/checkpatch" ./cmd/checkpatch
+          go build -o "$RUNNER_TEMP/bin/session" ./cmd/session
+      - name: Create check artifact directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          mkdir "$RUNNER_TEMP/artifacts/p0-product" "$RUNNER_TEMP/artifacts/p0-collected"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: p0-product
+          path: ${{ runner.temp }}/artifacts/p0-product
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: p0-collected
+          path: ${{ runner.temp }}/artifacts/p0-collected
+      - name: Populate the product module cache
+        env:
+          GOPROXY: https://proxy.golang.org
+          GOVCS: '*:off'
+          GOENV: 'off'
+          GOWORK: 'off'
+        run: |
+          export GOMODCACHE="$RUNNER_TEMP/modcache"
+          modules="$(mktemp -d "$RUNNER_TEMP/p0-modules.XXXXXXXX")"
+          mkdir -p "$GOMODCACHE"
+          tar -xzf "$RUNNER_TEMP/artifacts/p0-product/product.tar.gz" -C "$modules"
+          cd "$modules"
+          go mod download
+      - name: Pull the check image
+        run: docker pull "$CHECK_IMAGE"
+      - name: Check the patch and merge the record
+        id: check
+        working-directory: factory
+        env:
+          TASK: ${{ inputs.task }}
+          START_SECONDS: ${{ needs.start.outputs.runner_seconds }}
+        run: |
+          status=0
+          "$RUNNER_TEMP/bin/checkpatch" -product-archive "$RUNNER_TEMP/artifacts/p0-product/product.tar.gz" \
+            -patch "$RUNNER_TEMP/artifacts/p0-collected/patch.diff" -task "$TASK" -p0check "$RUNNER_TEMP/bin/p0check" \
+            -work "$RUNNER_TEMP/work" -runner docker -image "$CHECK_IMAGE" -modcache "$RUNNER_TEMP/modcache" \
+            > "$RUNNER_TEMP/checkresult.json" || status=$?
+          printf 'checkpatch exited %s\n' "$status"
+          printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          "$RUNNER_TEMP/bin/session" merge -record "$RUNNER_TEMP/artifacts/p0-collected/record.partial.json" \
+            -check "$RUNNER_TEMP/checkresult.json" -runner-start "$START_SECONDS" \
+            -runner-check "$(( $(date +%s) - P0_CHECK_TIME ))" -out "$RUNNER_TEMP/record.json"
+          {
+            printf '### P0 check record\n\n```json\n'
+            cat "$RUNNER_TEMP/record.json"
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: p0-record
+          path: ${{ runner.temp }}/record.json
+          if-no-files-found: error
+      - name: Fail on a check infrastructure error
+        if: steps.check.outputs.status == '2'
+        run: exit 1
+
+  record-probe:
+    needs: collect
+    if: inputs.role != 'fixer'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Create collected artifact directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          mkdir "$RUNNER_TEMP/artifacts/p0-collected"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: p0-collected
+          path: ${{ runner.temp }}/artifacts/p0-collected
+      - name: Summarize probe and session record
+        run: |
+          {
+            for name in probe.txt record.partial.json; do
+              printf '\n### %s\n\n' "$name"
+              if [[ -f "$RUNNER_TEMP/artifacts/p0-collected/$name" ]]; then
+                sed 's/^/    /' "$RUNNER_TEMP/artifacts/p0-collected/$name"
+              else
+                printf 'File unavailable.\n'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
