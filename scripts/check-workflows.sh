@@ -21,8 +21,14 @@ import yaml
 def emit(*values):
     sys.stdout.write("\0".join(values) + "\0")
 
+def mapping_value(node, key):
+    return next((value for name, value in node.value if name.value == key), None)
+
 with open(sys.argv[1], encoding="utf-8") as stream:
-    workflow = yaml.safe_load(stream)
+    loader = yaml.SafeLoader(stream)
+    root = loader.get_single_node()
+    workflow = loader.construct_document(root)
+jobs_node = mapping_value(root, "jobs")
 emit("workflow", str(int(workflow.get("permissions") == {})))
 default_dir = workflow.get("defaults", {}).get("run", {}).get("working-directory", "")
 for name, job in workflow["jobs"].items():
@@ -34,7 +40,10 @@ for name, job in workflow["jobs"].items():
          str(int(permissions == {"contents": "read"})), str(int(actions)), str(int(recovery_permissions)),
          job.get("uses", ""))
     job_dir = job.get("defaults", {}).get("run", {}).get("working-directory", default_dir)
-    for step in job.get("steps", []):
+    steps_node = mapping_value(mapping_value(jobs_node, name), "steps")
+    for index, step in enumerate(job.get("steps", [])):
+        run_node = mapping_value(steps_node.value[index], "run")
+        run_line = 0 if run_node is None else run_node.start_mark.line + 1 + int(run_node.style in ("|", ">"))
         inputs = step.get("with", {})
         persist = inputs.get("persist-credentials") is False
         factory = inputs.get("repository") == "toshi0607/agent-factory"
@@ -46,7 +55,7 @@ for name, job in workflow["jobs"].items():
         artifact_path = inputs.get("path") if step.get("uses", "").startswith("actions/download-artifact@") else ""
         emit("step", step.get("uses", ""), str(int(persist)), str(int(factory)), str(int(pinned_go)),
              str(int(factory_ref)), str(int(ref_guard)),
-             step.get("run", ""), step.get("working-directory", job_dir),
+             step.get("run", ""), str(run_line), step.get("working-directory", job_dir),
              artifact_path if isinstance(artifact_path, str) else "")
 PY
   else
@@ -55,7 +64,14 @@ def emit(*values)
   print values.join("\0"), "\0"
 end
 
-workflow = YAML.safe_load(File.read(ARGV.fetch(0)))
+def mapping_value(node, key)
+  pair = node.children.each_slice(2).find { |name, _| name.value == key }
+  pair && pair.last
+end
+
+source = File.read(ARGV.fetch(0))
+workflow = YAML.safe_load(source)
+jobs_node = mapping_value(YAML.parse(source).root, "jobs")
 emit("workflow", workflow["permissions"] == {} ? "1" : "0")
 default_dir = workflow.dig("defaults", "run", "working-directory") || ""
 workflow.fetch("jobs").each do |name, job|
@@ -67,7 +83,11 @@ workflow.fetch("jobs").each do |name, job|
        permissions == {"contents" => "read"} ? "1" : "0", actions ? "1" : "0",
        recovery_permissions ? "1" : "0", job.fetch("uses", ""))
   job_dir = job.dig("defaults", "run", "working-directory") || default_dir
-  job.fetch("steps", []).each do |step|
+  steps_node = mapping_value(mapping_value(jobs_node, name), "steps")
+  job.fetch("steps", []).each_with_index do |step, index|
+    run_node = mapping_value(steps_node.children[index], "run")
+    run_line = run_node ? run_node.start_line + 1 : 0
+    run_line += 1 if run_node && [Psych::Nodes::Scalar::LITERAL, Psych::Nodes::Scalar::FOLDED].include?(run_node.style)
     persist = step.dig("with", "persist-credentials") == false
     factory = step.dig("with", "repository") == "toshi0607/agent-factory"
     factory_ref = step.dig("with", "ref") == "${{ inputs.factory_ref }}"
@@ -77,7 +97,7 @@ workflow.fetch("jobs").each do |name, job|
     artifact_path = step.fetch("uses", "").start_with?("actions/download-artifact@") && step.dig("with", "path")
     emit("step", step.fetch("uses", ""), persist ? "1" : "0", factory ? "1" : "0", pinned_go ? "1" : "0",
          factory_ref ? "1" : "0", ref_guard ? "1" : "0",
-         step.fetch("run", ""), step.fetch("working-directory", job_dir),
+         step.fetch("run", ""), run_line, step.fetch("working-directory", job_dir),
          artifact_path.is_a?(String) ? artifact_path : "")
   end
 end
@@ -96,6 +116,8 @@ build='(^|[^[:alnum:]_.-])go[[:space:]]+build([^[:alnum:]_.-]|$)'
 # Match literal -o arguments in run blocks, including quoted paths and -o=path.
 build_output=$'(^|[^[:alnum:]_.-])go[[:blank:]]+build[[:blank:]]+([^;&|[:cntrl:]]*[[:blank:]])?-o([[:blank:]]+|=)("[^"]+"|\'[^\']+\'|[^[:space:];&|]+)'
 change_dir='(^|[^[:alnum:]_.-])(cd|pushd|popd)([^[:alnum:]_.-]|$)'
+session_path='\$(RUNNER_TEMP|\{RUNNER_TEMP\})(/bin)?/session'
+session_command="(^|[;&|])[[:blank:]]*((if|elif|then|else|do|!|exec)[[:blank:]]+)*(\"$session_path\"|$session_path)([[:blank:];&|<>]|$)"
 factory_ref_guard=$(cat <<'BASH'
 if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'factory_ref must be a full lowercase commit SHA\n' >&2
@@ -148,9 +170,20 @@ validate_artifact_paths() {
   done <<< "$downloads"
 }
 
+validate_session_invocations() {
+  local script=$1 line_number=$2 line
+  while IFS= read -r line; do
+    if [[ ! $line =~ ^[[:blank:]]*(exec[[:blank:]]|#) && $line =~ $session_command ]]; then
+      printf '%s:%s: start the session invocation with exec\n' "$file" "$line_number" >&2
+      exit 1
+    fi
+    ((++line_number))
+  done <<< "$script"
+}
+
 validate_workflow() {
   local record name= oidc empty contents_read actions recovery_permissions uses persist factory pinned_go
-  local factory_ref ref_guard checked_ref step_number script directory artifact_path
+  local factory_ref ref_guard checked_ref step_number script run_line directory artifact_path
   local downloads= outputs= commands output match
   while IFS= read -r -d '' record; do
     case $record in
@@ -196,9 +229,13 @@ validate_workflow() {
         IFS= read -r -d '' factory_ref
         IFS= read -r -d '' ref_guard
         IFS= read -r -d '' script
+        IFS= read -r -d '' run_line
         IFS= read -r -d '' directory
         IFS= read -r -d '' artifact_path
         ((++step_number))
+        if [[ $file == .github/workflows/* && $run_line != 0 ]]; then
+          validate_session_invocations "$script" "$run_line"
+        fi
         if [[ $step_number == 1 && $ref_guard == 1 && ${script%$'\n'} == "$factory_ref_guard" ]]; then
           checked_ref=1
         fi

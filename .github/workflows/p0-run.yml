@@ -113,7 +113,7 @@ jobs:
       id-token: write
       contents: read
     outputs:
-      runner_seconds: ${{ steps.start.outputs.runner_seconds }}
+      runner_seconds: ${{ steps.seconds.outputs.runner_seconds }}
     steps:
       - name: Validate factory ref
         shell: bash
@@ -180,9 +180,14 @@ jobs:
           if [[ -n "$MINUTES" ]]; then
             args+=(-minutes "$MINUTES")
           fi
-          "$RUNNER_TEMP/bin/session" start -policy policy/google-cloud-emulator.yaml \
+          exec "$RUNNER_TEMP/bin/session" start -policy policy/google-cloud-emulator.yaml \
             -role "$ROLE" -candidate "$CANDIDATE" -files "$RUNNER_TEMP/artifacts/p0-files" \
             -state "$RUNNER_TEMP/state.json" "${args[@]}"
+      - name: Record start runner time
+        id: seconds
+        env:
+          PREPARE_SECONDS: ${{ needs.prepare.outputs.runner_seconds }}
+        run: |
           printf 'runner_seconds=%s\n' "$(( $(date +%s) - P0_START_TIME + PREPARE_SECONDS ))" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
@@ -199,7 +204,7 @@ jobs:
           ANTHROPIC_WORKSPACE_ID: ${{ inputs.workspace_id }}
         run: |
           if [[ -f "$RUNNER_TEMP/state.json" ]]; then
-            "$RUNNER_TEMP/bin/session" cleanup -state "$RUNNER_TEMP/state.json"
+            exec "$RUNNER_TEMP/bin/session" cleanup -state "$RUNNER_TEMP/state.json"
           fi
 
   # If this job fails before the collect step, or the run is cancelled between
@@ -269,7 +274,7 @@ jobs:
       - name: Collect session outputs
         id: collect
         run: |
-          "$RUNNER_TEMP/bin/session" collect -state "$P0_STATE_PATH" -out "$RUNNER_TEMP/out"
+          exec "$RUNNER_TEMP/bin/session" collect -state "$P0_STATE_PATH" -out "$RUNNER_TEMP/out"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -289,7 +294,7 @@ jobs:
             printf '%s\n' "Session binary or state unavailable. Run the \"factory-p0-recover\" workflow with this run's id to clean up."
             exit 0
           fi
-          "$RUNNER_TEMP/bin/session" cleanup -state "$P0_STATE_PATH"
+          exec "$RUNNER_TEMP/bin/session" cleanup -state "$P0_STATE_PATH"
 
   check:
     needs: [start, collect]
@@ -372,9 +377,11 @@ jobs:
             > "$RUNNER_TEMP/checkresult.json" || status=$?
           printf 'checkpatch exited %s\n' "$status"
           printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
-          "$RUNNER_TEMP/bin/session" merge -record "$RUNNER_TEMP/artifacts/p0-collected/record.partial.json" \
+          exec "$RUNNER_TEMP/bin/session" merge -record "$RUNNER_TEMP/artifacts/p0-collected/record.partial.json" \
             -check "$RUNNER_TEMP/checkresult.json" -runner-start "$START_SECONDS" \
             -runner-check "$(( $(date +%s) - P0_CHECK_TIME ))" -out "$RUNNER_TEMP/record.json"
+      - name: Summarize the check record
+        run: |
           {
             printf '### P0 check record\n\n```json\n'
             cat "$RUNNER_TEMP/record.json"
