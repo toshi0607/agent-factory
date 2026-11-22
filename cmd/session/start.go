@@ -235,20 +235,27 @@ func fileResource(name, id string) claude.Resource {
 }
 
 func userMessage(resources []claude.Resource, ids map[string]string, probe bool) (string, error) {
+	// The response may carry session-scoped file IDs that differ from the
+	// uploaded ones, so resources are matched by the requested mount path.
 	paths := make(map[string]string)
 	for _, res := range resources {
-		if res.Type == "file" {
-			paths[res.FileID] = res.MountPath
+		if res.Type != "file" {
+			continue
+		}
+		for name := range ids {
+			if strings.HasSuffix(res.MountPath, "/workspace/"+name) {
+				paths[name] = res.MountPath
+			}
 		}
 	}
-	setup, task, finish := paths[ids["setup.sh"]], paths[ids["task.md"]], paths[ids["finish.sh"]]
+	setup, task, finish := paths["setup.sh"], paths["task.md"], paths["finish.sh"]
 	for _, mount := range []string{setup, task, finish} {
 		if !path.IsAbs(mount) || strings.ContainsAny(mount, " \t\r\n'\x22`$;&|<>()") {
 			return "", fmt.Errorf("session response has a missing or invalid mount path %q (%d resources, %d file mounts)",
 				mount, len(resources), len(paths))
 		}
 	}
-	if probe && paths[ids[probeScriptName]] != path.Join(path.Dir(setup), probeScriptName) {
+	if probe && paths[probeScriptName] != path.Join(path.Dir(setup), probeScriptName) {
 		return "", errors.New("session response must mount probe.sh next to setup.sh")
 	}
 	return fmt.Sprintf("Set up with: bash %s\nThe task is in: %s\nWhen you are done, run: bash %s\nThen reply DONE.", setup, task, finish), nil
