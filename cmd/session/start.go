@@ -244,7 +244,8 @@ func userMessage(resources []claude.Resource, ids map[string]string, probe bool)
 	setup, task, finish := paths[ids["setup.sh"]], paths[ids["task.md"]], paths[ids["finish.sh"]]
 	for _, mount := range []string{setup, task, finish} {
 		if !path.IsAbs(mount) || strings.ContainsAny(mount, " \t\r\n'\x22`$;&|<>()") {
-			return "", errors.New("session response has a missing or invalid mount path")
+			return "", fmt.Errorf("session response has a missing or invalid mount path %q (%d resources, %d file mounts)",
+				mount, len(resources), len(paths))
 		}
 	}
 	if probe && paths[ids[probeScriptName]] != path.Join(path.Dir(setup), probeScriptName) {
