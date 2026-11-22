@@ -60,18 +60,18 @@ jobs:
           fi
       - name: Start timer
         run: printf 'P0_PREPARE_TIME=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.sha }}
           path: product
           persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           repository: toshi0607/agent-factory
           ref: ${{ inputs.factory_ref }}
           path: factory
           persist-credentials: false
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version: '1.26.11'
           check-latest: false
@@ -92,12 +92,12 @@ jobs:
           "$RUNNER_TEMP/bin/prepare" -policy policy/google-cloud-emulator.yaml \
             -product ../product -task "$TASK" -out "$RUNNER_TEMP/files"
           printf 'runner_seconds=%s\n' "$(( $(date +%s) - P0_PREPARE_TIME ))" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: p0-files
           path: ${{ runner.temp }}/files
           if-no-files-found: error
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: p0-product
           path: |
@@ -126,13 +126,13 @@ jobs:
           fi
       - name: Start timer
         run: printf 'P0_START_TIME=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           repository: toshi0607/agent-factory
           ref: ${{ inputs.factory_ref }}
           path: factory
           persist-credentials: false
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version: '1.26.11'
           check-latest: false
@@ -150,7 +150,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/artifacts"
           mkdir "$RUNNER_TEMP/artifacts/p0-files"
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: p0-files
           path: ${{ runner.temp }}/artifacts/p0-files
@@ -189,7 +189,7 @@ jobs:
           PREPARE_SECONDS: ${{ needs.prepare.outputs.runner_seconds }}
         run: |
           printf 'runner_seconds=%s\n' "$(( $(date +%s) - P0_START_TIME + PREPARE_SECONDS ))" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
           name: p0-state
@@ -232,13 +232,13 @@ jobs:
             printf 'factory_ref must be a full lowercase commit SHA\n' >&2
             exit 1
           fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           repository: toshi0607/agent-factory
           ref: ${{ inputs.factory_ref }}
           path: factory
           persist-credentials: false
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version: '1.26.11'
           check-latest: false
@@ -256,7 +256,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/artifacts"
           mkdir "$RUNNER_TEMP/artifacts/p0-state"
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: p0-state
           path: ${{ runner.temp }}/artifacts/p0-state
@@ -275,13 +275,13 @@ jobs:
         id: collect
         run: |
           exec "$RUNNER_TEMP/bin/session" collect -state "$P0_STATE_PATH" -out "$RUNNER_TEMP/out"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
           name: p0-collected
           path: ${{ runner.temp }}/out
           if-no-files-found: warn
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         if: failure() && steps.validate-state.outcome == 'success'
         with:
           name: p0-state-after-collect
@@ -316,13 +316,13 @@ jobs:
           fi
       - name: Start timer
         run: printf 'P0_CHECK_TIME=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           repository: toshi0607/agent-factory
           ref: ${{ inputs.factory_ref }}
           path: factory
           persist-credentials: false
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version: '1.26.11'
           check-latest: false
@@ -340,11 +340,11 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/artifacts"
           mkdir "$RUNNER_TEMP/artifacts/p0-product" "$RUNNER_TEMP/artifacts/p0-collected"
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: p0-product
           path: ${{ runner.temp }}/artifacts/p0-product
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: p0-collected
           path: ${{ runner.temp }}/artifacts/p0-collected
@@ -387,7 +387,7 @@ jobs:
             cat "$RUNNER_TEMP/record.json"
             printf '```\n'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: p0-record
           path: ${{ runner.temp }}/record.json
@@ -407,7 +407,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/artifacts"
           mkdir "$RUNNER_TEMP/artifacts/p0-collected"
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: p0-collected
           path: ${{ runner.temp }}/artifacts/p0-collected
