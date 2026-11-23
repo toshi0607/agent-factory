@@ -28,6 +28,7 @@
     "ALLOWED_REPOSITORY_ID": "",
     "ALLOWED_REPOSITORY_OWNER_ID": "",
     "ALLOWED_JOB_WORKFLOWS": "",
+    "ALLOWED_REFS": "",
     "FACTORY_COMMIT": "",
     "INSTANCE_TYPE": "standard-3"
   }

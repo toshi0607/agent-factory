@@ -4,7 +4,10 @@ import { readResult, Run } from "../src/run";
 import type { Caller, Env, StartRequest } from "../src/types";
 import { startRequest } from "./fixtures";
 
-const disk = vi.hoisted(() => new Map<string, Uint8Array>());
+const { disk, oversized } = vi.hoisted(() => ({
+  disk: new Map<string, Uint8Array>(),
+  oversized: new Map<string, { size: bigint; body: ReadableStream<Uint8Array>; signal?: AbortSignal }>(),
+}));
 vi.mock("@cloudflare/sandbox", () => {
   class SandboxFileError extends Error {
     readonly code = "ENOENT";
@@ -12,10 +15,16 @@ vi.mock("@cloudflare/sandbox", () => {
   }
   class Files {
     async lstat(path: string) {
-      if (!disk.has(path)) throw new SandboxFileError();
-      return { type: "file" };
+      const size = oversized.get(path)?.size ?? disk.get(path)?.byteLength;
+      if (size === undefined) throw new SandboxFileError();
+      return { type: "file", size: BigInt(size) };
     }
-    async readFile(path: string) {
+    async readFile(path: string, { signal }: { signal?: AbortSignal } = {}) {
+      const output = oversized.get(path);
+      if (output) {
+        if (signal) output.signal = signal;
+        return new Response(output.body);
+      }
       const contents = disk.get(path);
       if (!contents) throw new SandboxFileError();
       return new Response(contents.slice());
@@ -37,11 +46,12 @@ vi.mock("@cloudflare/sandbox", () => {
 const id = "p0-20261123T012345Z-abcdef12";
 const token = { present: true, expires_at: "later" };
 const caller: Caller = {
-  repositoryId: crypto.randomUUID(), workflowPath: "path", workflowSha: "ab".repeat(20),
+  repositoryId: crypto.randomUUID(), workflowPath: "path", workflowSha: "ab".repeat(20), run_id: "123", run_attempt: "1",
 };
 
 function fixture() {
   let running = false;
+  let groupAlive = false;
   const history: string[] = [];
   const kv = new Map<string, unknown>();
   const toBytes = (text: string) => new TextEncoder().encode(text);
@@ -55,6 +65,10 @@ function fixture() {
     setInactivityTimeout: vi.fn(async () => { history.push("timeout"); }),
     exec: vi.fn(async (argv: string[], _options: ContainerExecOptions) => {
       history.push("exec");
+      if (argv[3] === "factory-liveness") return { exitCode: Promise.resolve(groupAlive ? 0 : 1) };
+      if (argv[0] === "tail") {
+        return { stdout: new Response(disk.get(argv[4]!)?.slice(-Number(argv[2]))).body, exitCode: Promise.resolve(0) };
+      }
       if (argv[0] !== "setsid") return { exitCode: Promise.resolve(0) };
       return {
         stdout: new Response("123\n").body,
@@ -82,17 +96,21 @@ function fixture() {
     LEDGER: { getByName: () => ledger }, INSTANCE_TYPE: "standard-3", FACTORY_COMMIT: "",
   } as unknown as Env);
   const run = create();
-  run.claim(id, caller);
+  void run.claim(id, caller, false);
   const upload = (name: string, contents = "abc", size = contents.length) => run.upload(name, new Response(contents).body, size);
   const start = async (overrides: Partial<StartRequest> = {}) => {
     for (const file of ["manifest.json", "task.md"]) await upload(file);
     return run.start({ ...startRequest, ...overrides });
   };
-  return { run, create, container, ledger, history, storage, outbound, inputs, upload, start, toBytes, lose: () => { running = false; } };
+  return {
+    run, create, container, ledger, history, storage, outbound, inputs, upload, start, toBytes,
+    lose: () => { running = false; }, setGroupAlive: (alive: boolean) => { groupAlive = alive; },
+  };
 }
 
 beforeEach(() => {
   disk.clear();
+  oversized.clear();
   vi.useFakeTimers({ toFake: ["Date"] });
 });
 afterEach(() => vi.useRealTimers());
@@ -100,8 +118,8 @@ afterEach(() => vi.useRealTimers());
 describe("Run lifecycle", () => {
   it("claims a run once and hashes each upload with both intercepts active", async () => {
     const { run, create, container, upload, outbound, history } = fixture();
-    expect(run.claim(id, { ...caller, workflowPath: "different" })).toBe(true);
-    expect(create().claim(id, { ...caller, repositoryId: crypto.randomUUID() })).toBe(false);
+    expect(await run.claim(id, { ...caller, workflowPath: "different" }, false)).toBe("claimed");
+    expect(await create().claim(id, { ...caller, repositoryId: crypto.randomUUID() }, false)).toBe("forbidden");
     expect(await (await upload("task.md")).json()).toEqual({
       name: "task.md", bytes: 3, sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
     });
@@ -133,7 +151,7 @@ describe("Run lifecycle", () => {
       { model: startRequest.model, egress: startRequest.egress }, startRequest.prices, startRequest.budget_cents,
     );
     expect(container.exec).toHaveBeenLastCalledWith(expect.arrayContaining(["setsid", "claude"]), expect.objectContaining({
-      cwd: "/factory", user: "1000:1000",
+      cwd: "/factory", user: "0:0",
       env: expect.objectContaining({
         NODE_EXTRA_CA_CERTS: "/etc/cloudflare/certs/cloudflare-containers-ca.crt",
         SSL_CERT_FILE: "/etc/cloudflare/certs/cloudflare-containers-ca.crt",
@@ -141,6 +159,11 @@ describe("Run lifecycle", () => {
         GIT_SSL_CAINFO: "/etc/cloudflare/certs/cloudflare-containers-ca.crt",
       }),
     }));
+    const launch = container.exec.mock.lastCall?.[0][5];
+    expect(launch).toContain("/factory/ctl/pid");
+    expect(launch).toContain("/factory/ctl/exit-code");
+    expect(launch).toMatch(/setpriv --reuid=agent --regid=agent --init-groups --no-new-privs/);
+    expect(launch).toContain(`'exec "$@" </dev/null >/factory/out/events.jsonl`);
   });
 
   it("leaves the container unprepared and executes nothing when interception fails", async () => {
@@ -156,7 +179,7 @@ describe("Run lifecycle", () => {
   it("resumes after eviction, observes the exit code and retains outputs for ten minutes", async () => {
     const { create, ledger, start, toBytes, storage, container } = fixture();
     await start();
-    disk.set("/factory/task/exit-code", toBytes("0\n"));
+    disk.set("/factory/ctl/exit-code", toBytes("0\n"));
     disk.set("/factory/out/events.jsonl", toBytes('{"type":"result","is_error":false}\n'));
     disk.set("/factory/out/patch.diff", toBytes("patch content"));
     const resumed = create();
@@ -179,7 +202,7 @@ describe("Run lifecycle", () => {
     const { run, start, container, ledger, upload, toBytes } = fixture();
     await upload("finish.sh");
     await start({ minutes: 1 });
-    disk.set("/factory/task/exit-code", toBytes("0\n"));
+    disk.set("/factory/ctl/exit-code", toBytes("0\n"));
     disk.set("/factory/out/events.jsonl", toBytes('{"type":"result","is_error":false}\n'));
     if (reason === "time_limit") {
       vi.setSystemTime(Date.now() + 60_000);
@@ -193,12 +216,174 @@ describe("Run lifecycle", () => {
     }
     expect((await run.stop("cancelled")).status).toBe(200);
     expect(await run.status()).toMatchObject({ state: "finished", stop_reason: reason, finish_ok: true, exit_code: 0 });
-    expect(container.exec.mock.calls.map(([argv]) => argv[0])).toEqual(["install", "setsid", "bash", "bash"]);
-    expect(container.exec.mock.calls[2]?.[0].at(-1)).toBe("123");
-    expect(container.exec).toHaveBeenLastCalledWith(["bash", "/factory/delivery/finish.sh"], expect.objectContaining({
+    const kill = ["bash", "-c", "kill -KILL -1"];
+    expect(container.exec.mock.calls.slice(2).map(([argv]) => argv)).toEqual([
+      kill, ["bash", "/factory/delivery/finish.sh"], kill,
+      ["tail", "-c", "262144", "--", "/factory/out/events.jsonl"],
+    ]);
+    expect(container.exec).toHaveBeenNthCalledWith(3, kill, expect.objectContaining({ user: "1000:1000" }));
+    expect(container.exec).toHaveBeenNthCalledWith(4, ["bash", "/factory/delivery/finish.sh"], expect.objectContaining({
       user: "1000:1000", signal: expect.any(AbortSignal),
       env: expect.objectContaining({ FACTORY_WORK_DIR: "/factory/work", FACTORY_OUT_DIR: "/factory/out" }),
     }));
+  });
+
+  it("records the first workflow SHA and grants recovery without granting input changes", async () => {
+    const { run, create } = fixture();
+    for (const other of [{ run_id: "999" }, { run_attempt: "2" }]) {
+      const recovery = { ...caller, ...other, workflowSha: "cd".repeat(20) };
+      expect(await create().claim(id, recovery, false)).toBe("claimed");
+      expect(await create().claim(id, recovery, true)).toBe("wrong_run");
+    }
+    expect(await run.claim(id, caller, true)).toBe("claimed");
+    expect(await run.status()).toMatchObject({ caller_workflow_sha: caller.workflowSha });
+  });
+
+  it.each([false, true])("destroys an unstarted run after 15 minutes with uploaded files = %s", async uploaded => {
+    const { run, create, storage, upload, container, ledger } = fixture();
+    const expiry = Date.now() + 15 * 60_000;
+    expect(storage.setAlarm).toHaveBeenCalledWith(expiry);
+    if (uploaded) await upload("task.md");
+    vi.setSystemTime(expiry - 1);
+    const resumed = create();
+    await resumed.alarm();
+    expect((await run.status()).state).toBe("created");
+    vi.setSystemTime(expiry);
+    await resumed.alarm();
+    expect(await run.status()).toMatchObject({ state: "destroyed", stop_reason: "cancelled" });
+    expect(ledger.deactivate).toHaveBeenCalledWith(true);
+    expect(container.destroy).toHaveBeenCalledTimes(Number(uploaded));
+    expect(storage.deleteAlarm).toHaveBeenCalled();
+  });
+
+  it("ignores a forged or premature exit-code until the recorded process group exits", async () => {
+    const { run, start, toBytes, setGroupAlive, container, ledger } = fixture();
+    await start();
+    disk.set("/factory/task/exit-code", toBytes("0\n"));
+    await run.alarm();
+    expect((await run.status()).state).toBe("running");
+    disk.set("/factory/ctl/exit-code", toBytes("0\n"));
+    disk.set("/factory/out/events.jsonl", toBytes('{"type":"result","is_error":false}\n'));
+    setGroupAlive(true);
+    await run.alarm();
+    expect((await run.status()).state).toBe("running");
+    expect(container.exec).toHaveBeenLastCalledWith(
+      ["bash", "-c", expect.stringContaining("kill -0"), "factory-liveness", "123"],
+      expect.objectContaining({ user: "0:0" }),
+    );
+    expect(ledger.deactivate).not.toHaveBeenCalled();
+    setGroupAlive(false);
+    await run.alarm();
+    expect(await run.status()).toMatchObject({ state: "finished", stop_reason: "completed" });
+    expect(container.exec.mock.calls.slice(-2).map(([argv]) => argv)).toEqual([
+      ["bash", "-c", "kill -KILL -1"], ["tail", "-c", "262144", "--", "/factory/out/events.jsonl"],
+    ]);
+  });
+
+  it("still kills the agent and runs finish at the deadline with a live process group", async () => {
+    const { run, start, upload, setGroupAlive, toBytes, container } = fixture();
+    await upload("finish.sh");
+    await start({ minutes: 1 });
+    setGroupAlive(true);
+    disk.set("/factory/ctl/exit-code", toBytes("0\n"));
+    await run.alarm();
+    expect((await run.status()).state).toBe("running");
+    container.exec.mockResolvedValueOnce({ exitCode: Promise.resolve(1) });
+    vi.setSystemTime(Date.now() + 60_000);
+    await run.alarm();
+    expect(await run.status()).toMatchObject({ stop_reason: "time_limit", finish_ok: true });
+  });
+
+  it("reads results only from the last 256 KiB", async () => {
+    const { run, start, toBytes, container } = fixture();
+    await start();
+    disk.set("/factory/ctl/exit-code", toBytes("0\n"));
+    disk.set("/factory/out/events.jsonl", toBytes(
+      '{"type":"result","is_error":false}\n' + "a".repeat(256 * 1024) + "\n",
+    ));
+    await run.alarm();
+    expect(await run.status()).toMatchObject({ stop_reason: "agent_error", agent_result: null });
+    expect(container.exec).toHaveBeenLastCalledWith(
+      ["tail", "-c", "262144", "--", "/factory/out/events.jsonl"],
+      expect.objectContaining({ user: "1000:1000", signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it.each([false, true])("caps an output stream at 64 MiB, with an oversized file = %s", async truncated => {
+    const { run, start } = fixture();
+    await start();
+    const chunk = new Uint8Array(1024 * 1024);
+    let remaining = 64;
+    const cancel = vi.fn();
+    const source = {
+      size: BigInt(64 * chunk.length + Number(truncated)),
+      body: new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (remaining-- > 0) controller.enqueue(chunk);
+          else if (truncated) controller.enqueue(chunk.subarray(0, 1));
+          else controller.close();
+        },
+        cancel,
+      }),
+    };
+    const path = "/factory/out/stderr.log";
+    oversized.set(path, source);
+    const response = await run.output("stderr.log");
+    expect(response.headers.get("x-factory-truncated")).toBe(truncated ? "1" : null);
+    expect(oversized.get(path)?.signal).toBeInstanceOf(AbortSignal);
+    const reader = response.body!.getReader();
+    let bytes = 0;
+    for (let part = await reader.read(); !part.done; part = await reader.read()) bytes += part.value.length;
+    expect(bytes).toBe(64 * chunk.length);
+    if (truncated) await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+  });
+
+  it("aborts a stalled output read at its timeout", async () => {
+    const { run, start } = fixture();
+    await start();
+    const abort = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(abort.signal);
+    const cancel = vi.fn();
+    try {
+      oversized.set("/factory/out/stderr.log", { size: 1n, body: new ReadableStream({ cancel }) });
+      const response = await run.output("stderr.log");
+      expect(timeout).toHaveBeenCalledWith(30_000);
+      const result = response.text();
+      const rejected = expect(result).rejects.toMatchObject({ name: "TimeoutError" });
+      abort.abort(new DOMException("Timed out", "TimeoutError"));
+      await rejected;
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
+  it("abandons a stalled result read at 30 seconds and finalizes the run", async () => {
+    const { run, start, toBytes, container } = fixture();
+    await start();
+    disk.set("/factory/ctl/exit-code", toBytes("0\n"));
+    disk.set("/factory/out/events.jsonl", toBytes("incomplete"));
+    const abort = new AbortController();
+    const realTimeout = AbortSignal.timeout;
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => ms === 30_000 ? abort.signal : realTimeout(ms));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const cancel = vi.fn();
+    try {
+      container.exec.mockResolvedValueOnce({ exitCode: Promise.resolve(1) }); // Group is gone.
+      container.exec.mockResolvedValueOnce({ exitCode: Promise.resolve(0) }); // Kill escaped processes.
+      container.exec.mockImplementationOnce(async () => {
+        const stdout = new ReadableStream({ cancel });
+        queueMicrotask(() => abort.abort(new DOMException("Timed out", "TimeoutError")));
+        return { stdout, exitCode: Promise.resolve(0) };
+      });
+      await run.alarm();
+      expect(timeout).toHaveBeenCalledWith(30_000);
+      expect(await run.status()).toMatchObject({ state: "finished", agent_result: null });
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally {
+      timeout.mockRestore();
+      warn.mockRestore();
+    }
   });
 
   it("marks a missing container as lost and never executes in it again", async () => {

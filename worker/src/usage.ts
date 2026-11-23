@@ -22,8 +22,13 @@ function tokenCount(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
-function tokenFields(value: unknown): Partial<TokenCounts> {
-  const source = object(value);
+function checkServerTools(source: Record<string, unknown> | undefined): void {
+  if (!source || !("server_tool_use" in source)) return;
+  const serverTools = object(source.server_tool_use);
+  if (!serverTools || Object.values(serverTools).some(count => count !== 0)) throw new Error("unexpected server tool usage");
+}
+
+function tokenFields(source: Record<string, unknown> | undefined): Partial<TokenCounts> {
   if (!source) return {};
   const counts: Partial<TokenCounts> = {};
   for (const field of ["input_tokens", "output_tokens", "cache_read_input_tokens"] as const) {
@@ -70,11 +75,15 @@ async function streamUsage(body: ReadableStream<Uint8Array>): Promise<Partial<To
     const parsed = object(JSON.parse(data.join("\n")));
     data = [];
     size = 0;
+    const messageUsage = object(object(parsed?.message)?.usage);
+    const usage = object(parsed?.usage);
+    checkServerTools(messageUsage);
+    checkServerTools(usage);
     if (parsed?.type === "message_start") {
       if (start || delta) throw new Error("repeated message start");
-      start = tokenFields(object(parsed.message)?.usage);
+      start = tokenFields(messageUsage);
     } else if (parsed?.type === "message_delta" && start) {
-      const current = tokenFields(parsed.usage);
+      const current = tokenFields(usage);
       delta = { ...delta, ...current, output_tokens: current.output_tokens ?? -1 };
     }
   }
@@ -96,6 +105,12 @@ async function streamUsage(body: ReadableStream<Uint8Array>): Promise<Partial<To
   return { ...start, ...delta };
 }
 
+export function estimatedTokens(requestBytes: number, maxTokens: number): TokenCounts {
+  return { ...ZERO_TOKENS, input_tokens: Math.ceil(requestBytes / 3), output_tokens: maxTokens };
+}
+
+export type Settlement = Metering | "failure" | "zero";
+
 export async function meterResponse(
   body: ReadableStream<Uint8Array> | null, contentType: string | null, requestBytes: number, maxTokens: unknown,
 ): Promise<Metering> {
@@ -108,19 +123,21 @@ export async function meterResponse(
         controller.enqueue(chunk);
       },
     }));
-    const counts = contentType?.split(";")[0]?.trim().toLowerCase() === "text/event-stream"
-      ? await streamUsage(counted)
-      : tokenFields(object(JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false })
-          .decode(await readBytes(counted, MAX_JSON_BYTES))))?.usage);
+    let counts: Partial<TokenCounts>;
+    if (contentType?.split(";")[0]?.trim().toLowerCase() === "text/event-stream") {
+      counts = await streamUsage(counted);
+    } else {
+      const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false })
+        .decode(await readBytes(counted, MAX_JSON_BYTES));
+      const usage = object(object(JSON.parse(text))?.usage);
+      checkServerTools(usage);
+      counts = tokenFields(usage);
+    }
     if (counts.input_tokens === undefined || counts.output_tokens === undefined) throw new Error("missing usage");
     return { tokens: { ...ZERO_TOKENS, ...counts }, unmetered: false, responseBytes };
   } catch {
     return {
-      tokens: {
-        ...ZERO_TOKENS,
-        input_tokens: Math.ceil(requestBytes / 3),
-        output_tokens: tokenCount(maxTokens) ?? Number.MAX_SAFE_INTEGER,
-      },
+      tokens: estimatedTokens(requestBytes, tokenCount(maxTokens) ?? Number.MAX_SAFE_INTEGER),
       unmetered: true,
       responseBytes,
     };

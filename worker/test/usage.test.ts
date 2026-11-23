@@ -117,3 +117,19 @@ describe("integer microcent arithmetic", () => {
     expect(costMicrocents(tokens, startRequest.prices)).toBe(Number.MAX_SAFE_INTEGER);
   });
 });
+
+it("charges the fallback on non-zero server-tool usage in JSON and SSE", async () => {
+  const bad = { input_tokens: 5, output_tokens: 7, server_tool_use: { web_fetch_requests: 0, web_search_requests: 1 } };
+  expect(await json(bad)).toMatchObject({
+    unmetered: true, tokens: { input_tokens: 4, output_tokens: 99 },
+  });
+  expect(await json({ ...bad, server_tool_use: { web_search_requests: 0 } })).toMatchObject({
+    unmetered: false, tokens: { input_tokens: 5, output_tokens: 7 },
+  });
+  const events = [
+    { type: "message_start", message: { usage: { input_tokens: 5, output_tokens: 1 } } },
+    { type: "message_delta", usage: bad },
+    { type: "message_stop" },
+  ].map(event => `data: ${JSON.stringify(event)}\n\n`).join("");
+  expect(await meterResponse(new Response(events).body, "text/event-stream", 10, 99)).toMatchObject({ unmetered: true });
+});

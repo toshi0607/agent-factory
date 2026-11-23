@@ -1,7 +1,8 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { duplicateField, filterBeta, validateLlmBody } from "./llm-request";
 import { BodyTooLarge, readBytes } from "./streams";
-import { object, type Authorization, type EgressEntry, type Env, type Rules } from "./types";
-import { meterResponse, type Metering } from "./usage";
+import type { Authorization, EgressEntry, Env, PricedRules, Reservation, Rules } from "./types";
+import { costMicrocents, estimatedTokens, meterResponse, type Settlement } from "./usage";
 
 const ANTHROPIC = "api.anthropic.com";
 const MESSAGES = "/v1/messages";
@@ -9,7 +10,7 @@ const COUNT_TOKENS = "/v1/messages/count_tokens";
 const MAX_LLM_BODY = 32 * 1024 * 1024;
 const READ_HEADERS = new Set(["accept", "accept-encoding", "user-agent", "range", "if-none-match", "if-modified-since"]);
 const LLM_HEADERS = new Set([
-  "content-type", "accept", "anthropic-version", "anthropic-beta", "user-agent", "x-app",
+  "content-type", "accept", "anthropic-version", "user-agent", "x-app",
   "anthropic-dangerous-direct-browser-access",
 ]);
 const encoder = new TextEncoder();
@@ -22,11 +23,11 @@ export interface RequestSummary {
   transferEncoding: boolean;
 }
 
-type Decision =
+type Decision<T extends Rules> =
   | { action: "deny"; reason: string }
   | { action: "allow"; url: URL }
-  | { action: "llm"; url: URL; meter: boolean; model: string };
-const deny = (reason: string): Decision => ({ action: "deny", reason });
+  | { action: "llm"; url: URL; meter: boolean; rules: T };
+const deny = (reason: string) => ({ action: "deny" as const, reason });
 
 function parseUrl(input: string): URL | undefined {
   try {
@@ -42,7 +43,8 @@ function ambiguousPath(rawUrl: string, path: string): boolean {
     || /%(?:2e|2f|5c|25)/i.test(path);
 }
 
-export function decide(request: RequestSummary, rules: Rules | null): Decision {
+export function decide<T extends Rules>(request: RequestSummary, rules: T | "inactive" | null): Decision<T> {
+  if (rules === "inactive") return deny("run_not_running");
   if (!rules) return deny("run_not_started");
   const url = parseUrl(request.url);
   if (!url) return deny("invalid_url");
@@ -57,7 +59,7 @@ export function decide(request: RequestSummary, rules: Rules | null): Decision {
       || (url.search !== "" && url.search !== "?beta=true")) {
       return deny("llm_path");
     }
-    return { action: "llm", url, meter: url.pathname === MESSAGES, model: rules.model };
+    return { action: "llm", url, meter: url.pathname === MESSAGES, rules };
   }
   const rule = rules.egress.find(entry => entry.host === host);
   if (host.endsWith(".") || host.endsWith(".anthropic.com") || !rule) return deny("host_not_allowed");
@@ -74,11 +76,11 @@ export function decide(request: RequestSummary, rules: Rules | null): Decision {
 
 type Awaitable<T> = T | Promise<T>;
 export interface OutboundLedger {
-  rules(): Awaitable<Rules | null>;
-  authorize(checkBudget: boolean): Awaitable<Authorization>;
+  rules(): Awaitable<PricedRules | "inactive" | null>;
+  authorize(reservation?: Reservation): Awaitable<Authorization>;
   record(entry: EgressEntry): Awaitable<number | null>;
-  recordFailure(): Awaitable<void>;
-  meter(sample: Metering, entry: EgressEntry, row: number | null): Awaitable<void>;
+  recordFailure(entry: EgressEntry): Awaitable<void>;
+  meter(requestId: string, sample: Settlement, entry: EgressEntry, row: number | null): Awaitable<void>;
   flagMeteringFailure(): Awaitable<void>;
 }
 
@@ -116,7 +118,7 @@ async function record(ledger: OutboundLedger, entry: EgressEntry): Promise<numbe
   } catch {
     console.warn({ event: "egress_record_failed" });
     try {
-      await ledger.recordFailure();
+      await ledger.recordFailure(entry);
     } catch {
       console.warn({ event: "egress_drop_count_failed" });
     }
@@ -125,10 +127,11 @@ async function record(ledger: OutboundLedger, entry: EgressEntry): Promise<numbe
 }
 
 async function settle(
-  ledger: OutboundLedger, sample: Promise<Metering>, entry: EgressEntry, row: Promise<number | null>,
+  ledger: OutboundLedger, requestId: string, sample: Promise<Settlement>, entry: EgressEntry, row: Promise<number | null>,
 ): Promise<void> {
   try {
-    await ledger.meter(await sample, entry, await row);
+    const result = await sample.catch(() => "failure" as const);
+    await ledger.meter(requestId, result, entry, result === "zero" ? null : await row);
   } catch {
     console.error({ event: "metering_write_failed" });
     try {
@@ -146,56 +149,15 @@ function reportedLength(headers: Headers): number | undefined {
   return Number.isSafeInteger(number) ? number : undefined;
 }
 
-// A duplicate security-relevant key can be interpreted differently by an upstream JSON parser.
-function hasDuplicateMessageField(text: string): boolean {
-  const structural = /["\\{}\[\],]/g;
-  const seen = new Set<string>();
-  let depth = 0;
-  let expectingKey = false;
-  let quoted = false;
-  let keyStart = -1;
-  for (let match = structural.exec(text); match; match = structural.exec(text)) {
-    const character = match[0];
-    if (quoted) {
-      if (character === "\\") {
-        structural.lastIndex += 1;
-      } else if (character === '"') {
-        quoted = false;
-        if (keyStart >= 0) {
-          const field: unknown = match.index - keyStart <= 61
-            ? JSON.parse(text.slice(keyStart, structural.lastIndex)) : undefined;
-          if (field === "model" || field === "max_tokens") {
-            if (seen.has(field)) return true;
-            seen.add(field);
-          }
-          keyStart = -1;
-          expectingKey = false;
-        }
-      }
-    } else if (character === '"') {
-      quoted = true;
-      if (depth === 1 && expectingKey) keyStart = match.index;
-    } else if (character === "{" || character === "[") {
-      depth += 1;
-      if (depth === 1) expectingKey = true;
-    } else if (character === "}" || character === "]") {
-      depth -= 1;
-    } else if (character === "," && depth === 1) {
-      expectingKey = true;
-    }
-  }
-  return false;
-}
-
 export async function handle(request: Request, { ledger, upstream, now, waitUntil }: Dependencies): Promise<Response> {
   const base = logEntry(request, now());
   function finish(response: Response, details: Pick<EgressEntry, "decision" | "reason"> & Partial<EgressEntry>,
-    sample?: Promise<Metering>): Response {
-    const responseBytes = sample ? undefined : reportedLength(response.headers);
+    settlement?: { requestId: string; sample: Promise<Settlement> }): Response {
+    const responseBytes = reportedLength(response.headers);
     const entry: EgressEntry = { ...base, ...details, status: response.status };
     if (responseBytes !== undefined) entry.response_bytes = responseBytes;
     const row = record(ledger, entry);
-    waitUntil(sample ? settle(ledger, sample, entry, row) : row);
+    waitUntil(settlement ? Promise.all([row, settle(ledger, settlement.requestId, settlement.sample, entry, row)]) : row);
     return response;
   }
   function denied(reason: string, details: Partial<EgressEntry> = {}): Response {
@@ -207,7 +169,7 @@ export async function handle(request: Request, { ledger, upstream, now, waitUnti
     return finish(new Response(`factory: ${reason}\n`, { status: 502 }), { ...details, decision, reason });
   }
 
-  let rules: Rules | null;
+  let rules: PricedRules | "inactive" | null;
   try {
     rules = await ledger.rules();
   } catch {
@@ -231,52 +193,76 @@ export async function handle(request: Request, { ledger, upstream, now, waitUnti
     }
   }
 
+  const beta = filterBeta(request.headers.get("anthropic-beta"));
+  const betaDetails = beta.dropped.length ? { beta_dropped: beta.dropped } : {};
   if (contentLength !== null && /^\d+$/.test(contentLength) && Number(contentLength) > MAX_LLM_BODY) {
-    return denied("llm_body_too_large");
+    return denied("llm_body_too_large", betaDetails);
   }
   let body: Uint8Array<ArrayBuffer>;
-  let parsed: Record<string, unknown> | undefined;
+  let parsed: unknown;
+  let text: string;
   try {
     body = await readBytes(request.body, MAX_LLM_BODY);
-    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(body);
-    parsed = object(JSON.parse(text));
-    if (parsed && hasDuplicateMessageField(text)) parsed = undefined;
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(body);
+    parsed = JSON.parse(text);
   } catch (error) {
-    return denied(error instanceof BodyTooLarge ? "llm_body_too_large" : "llm_model");
+    return denied(error instanceof BodyTooLarge ? "llm_body_too_large" : "llm_model", betaDetails);
   }
-  const details = { request_bytes: body.length };
-  if (!parsed || parsed.model !== decision.model) return denied("llm_model", details);
-  const llmDetails = { ...details, model: decision.model };
+  const details = { ...betaDetails, request_bytes: body.length };
+  const { model, prices } = decision.rules;
+  const validation = validateLlmBody(parsed, model);
+  if (!validation.ok) {
+    return validation.reason === "model" ? denied("llm_model", details)
+      : denied("llm_body", { ...details, body_reason: validation.reason });
+  }
+  const duplicate = duplicateField(text, parsed);
+  if (duplicate === "model") return denied("llm_model", details);
+  if (duplicate) return denied("llm_body", { ...details, body_reason: duplicate });
+  const { maxTokens } = validation;
+  const llmDetails = { ...details, model };
+  if (decision.meter && maxTokens === undefined) return denied("llm_body", { ...llmDetails, body_reason: "max_tokens" });
 
   let authorization: Authorization;
+  let reservation: Reservation | undefined;
   try {
-    authorization = await ledger.authorize(decision.meter);
+    if (decision.meter && maxTokens !== undefined) {
+      reservation = {
+        request_id: crypto.randomUUID(),
+        estimate_microcents: costMicrocents(estimatedTokens(body.length, maxTokens), prices),
+      };
+    }
+    authorization = await ledger.authorize(reservation);
   } catch {
     return failed("ledger_unavailable", "deny", llmDetails);
   }
   if (!authorization.ok) {
     const { reason } = authorization;
-    const status = reason === "no_token" || reason === "token_expired" ? 503 : 403;
+    const rateLimited = reason === "too_many_inflight";
+    const status = rateLimited ? 429 : reason === "no_token" || reason === "token_expired" ? 503 : 403;
+    const headers = new Headers({ "x-factory-denied": reason });
+    if (rateLimited) headers.set("retry-after", "5");
     return finish(Response.json({
-      type: "error", error: { type: "permission_error", message: `factory: ${reason}` },
-    }, { status }), { ...llmDetails, decision: "deny", reason });
+      type: "error", error: { type: rateLimited ? "rate_limit_error" : "permission_error", message: `factory: ${reason}` },
+    }, { status, headers }), { ...llmDetails, decision: "deny", reason });
   }
 
   const headers = headersFor(request, true);
+  if (beta.forwarded) headers.set("anthropic-beta", beta.forwarded);
   headers.set("authorization", `Bearer ${authorization.token}`);
+  const entry = { ...llmDetails, decision: "llm" as const };
+  const zero = reservation && { requestId: reservation.request_id, sample: Promise.resolve("zero" as const) };
   let response: Response;
   try {
     response = await upstream(decision.url.href, { method: "POST", headers, body, redirect: "manual" });
   } catch {
-    return failed("upstream_error", "llm", llmDetails);
+    return finish(new Response("factory: upstream_error\n", { status: 502 }), { ...entry, reason: "upstream_error" }, zero);
   }
-  const entry = { ...llmDetails, decision: "llm" as const };
-  if (response.status !== 200 || !decision.meter) return finish(response, entry);
+  if (!reservation || response.status !== 200) return finish(response, entry, zero);
   const [guest, metering] = response.body?.tee() ?? [null, null];
-  const sample = meterResponse(metering, response.headers.get("content-type"), body.length, parsed.max_tokens);
+  const sample = meterResponse(metering, response.headers.get("content-type"), body.length, maxTokens);
   return finish(new Response(guest, {
     status: response.status, statusText: response.statusText, headers: response.headers,
-  }), entry, sample);
+  }), entry, { requestId: reservation.request_id, sample });
 }
 
 export class Outbound extends WorkerEntrypoint<Env, { runId: string }> {

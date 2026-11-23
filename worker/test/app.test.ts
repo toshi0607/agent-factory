@@ -58,6 +58,8 @@ describe("routes and request validation", () => {
     { egress: [{ host: "example.invalid:443" }] }, { egress: [{ host: "example.invalid." }] },
     { egress: [{ host: "0x7f000001" }] }, { egress: [{ host: "127.0.0.1" }] },
     { egress: [{ host: "example.invalid", path_prefixes: ["prefix"] }] },
+    { egress: [{ host: "example.invalid", path_prefixes: ["/prefix"] }] },
+    { egress: [{ host: "example.invalid" }, { host: "example.invalid", path_prefixes: ["/other/"] }] },
     { egress: [{ host: "example.invalid", path_prefixes: ["/prefix?query"] }] },
     { egress: [{ host: "example.invalid", path_prefixes: ["/prefix/%2e/"] }] },
     { egress: [{ host: "example.invalid", path_prefixes: [] }] },
@@ -70,12 +72,15 @@ describe("routes and request validation", () => {
 
 describe("Worker HTTP API", () => {
   function client(owned = true, authenticated = true) {
-    const caller: Caller = { repositoryId: crypto.randomUUID(), workflowPath: "path", workflowSha: "01".repeat(20) };
-    const claim = vi.fn(async () => owned);
+    const caller: Caller = { repositoryId: crypto.randomUUID(), workflowPath: "path", workflowSha: "01".repeat(20), run_id: "1", run_attempt: "1" };
+    const claim = vi.fn<import("../src/run").Run["claim"]>(async () => owned ? "claimed" : "forbidden");
     const upload = vi.fn(async () => new Response(null, { status: 204 }));
     const token = vi.fn(async () => Response.json({ expires_at: "later" }));
-    const getByName = vi.fn(() => ({ claim, upload, token }));
-    const env = { RUN: { getByName } } as unknown as Env;
+    const noContent = async () => new Response(null, { status: 204 });
+    const getByName = vi.fn(() => ({
+      claim, upload, token, status: async () => ({}), destroy: noContent, output: noContent, stop: noContent,
+    }));
+    const env = { RUN: { getByName }, LEDGER: { getByName: () => ({ egress: noContent }) } } as unknown as Env;
     const app = createApp({
       verify: async () => authenticated ? { ok: true, caller } : { ok: false, error: "invalid_token" },
     });
@@ -101,6 +106,32 @@ describe("Worker HTTP API", () => {
     const { send, claim } = client(false);
     expect((await send(base)).status).toBe(403);
     expect(claim).toHaveBeenCalledOnce();
+  });
+
+  it("checks workflow-run ownership only on input-mutating routes", async () => {
+    const { send, claim, upload, token } = client();
+    claim.mockImplementation(async (_id, _caller, changesInputs) => changesInputs ? "wrong_run" : "claimed");
+    const file = await send(base + "/files/task.md", { method: "PUT" });
+    const start = await send(base + "/start", { method: "POST" });
+    expect(file.status).toBe(403);
+    expect(start.status).toBe(403);
+    expect(await file.json()).toMatchObject({ error: "wrong_run" });
+    expect(await start.json()).toMatchObject({ error: "wrong_run" });
+    expect(upload).not.toHaveBeenCalled();
+    const recovery = await send(base + "/token", {
+      method: "PUT", body: JSON.stringify({ access_token: crypto.randomUUID(), expires_in: 30 }),
+    });
+    expect(recovery.status).toBe(200);
+    expect(token).toHaveBeenCalledOnce();
+    const cases = [
+      [base, "GET"], [base, "DELETE"], [base + "/egress", "GET"],
+      [base + "/outputs/patch.diff", "GET"], [base + "/stop", "POST"],
+    ] as const;
+    for (const [path, method] of cases) {
+      const response = await send(path, { method, ...(method === "POST" ? { body: '{"reason":"cancelled"}' } : {}) });
+      expect(response.ok).toBe(true);
+      expect(claim).toHaveBeenLastCalledWith(id, expect.any(Object), false);
+    }
   });
 
   it("requires Content-Length and enforces the 95 MiB limit before forwarding", async () => {

@@ -4,7 +4,7 @@ FROM --platform=linux/amd64 ${SANDBOX_TOOLS_IMAGE} AS sandbox-tools
 
 FROM --platform=linux/amd64 node:26-bookworm-slim
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bash ca-certificates curl git make python3 diffutils ripgrep procps \
+  && apt-get install -y --no-install-recommends bash ca-certificates curl git make python3 diffutils ripgrep procps util-linux \
   && rm -rf /var/lib/apt/lists/*
 RUN npm install --global @anthropic-ai/claude-code@2.1.316
 COPY --from=sandbox-tools /usr/local/bin/sandbox-shim /usr/local/bin/sandbox-shim
@@ -14,6 +14,7 @@ RUN tar -xzf /tmp/go.tgz -C /opt \
   && groupmod -n agent node \
   && usermod --login agent --home /home/agent --move-home node \
   && test "$(id -u agent):$(id -g agent)" = "1000:1000" \
-  && install -d -o agent -g agent /factory
+  && test -x /usr/bin/setpriv \
+  && install -d -o root -g root -m 0755 /factory /factory/ctl
 WORKDIR /factory
 CMD ["sleep","infinity"]

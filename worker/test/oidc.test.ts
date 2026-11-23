@@ -9,6 +9,7 @@ const env: OidcEnv = {
   OIDC_AUDIENCE: "factory",
   ALLOWED_REPOSITORY_ID: String(crypto.getRandomValues(new Uint32Array(1))[0]),
   ALLOWED_REPOSITORY_OWNER_ID: String(crypto.getRandomValues(new Uint32Array(1))[0]),
+  ALLOWED_REFS: "refs/tags/recovery, refs/heads/main",
   ALLOWED_JOB_WORKFLOWS: `example/other/.github/workflows/p0-run.yml, ${path}`,
 };
 const claims = {
@@ -18,6 +19,7 @@ const claims = {
   repository_id: env.ALLOWED_REPOSITORY_ID, repository_owner_id: env.ALLOWED_REPOSITORY_OWNER_ID,
   job_workflow_ref: `${path}@refs/heads/main`,
   job_workflow_sha: "ab".repeat(20),
+  ref: "refs/heads/main", run_id: "1234", run_attempt: "2",
 };
 let pair: CryptoKeyPair;
 let jwk: JsonWebKey;
@@ -50,7 +52,10 @@ const verifier = () => createVerifier(async () => jwks(), () => time * 1000);
 describe("GitHub OIDC", () => {
   it.each([[claims.aud], [[claims.aud]]])("accepts a valid token with audience %j", async aud => {
     expect(await verifier()(await jwt({ aud }), env)).toEqual({
-      ok: true, caller: { repositoryId: env.ALLOWED_REPOSITORY_ID, workflowPath: path, workflowSha: claims.job_workflow_sha },
+      ok: true, caller: {
+        repositoryId: env.ALLOWED_REPOSITORY_ID, workflowPath: path, workflowSha: claims.job_workflow_sha,
+        run_id: claims.run_id, run_attempt: claims.run_attempt,
+      },
     });
   });
 
@@ -76,9 +81,22 @@ describe("GitHub OIDC", () => {
     ["workflow suffix", { job_workflow_ref: `${path}.evil@x` }, "wrong_workflow"],
     ["wrong repository path", { job_workflow_ref: "unrelated/factory/.github/workflows/p0-run.yml@x" }, "wrong_workflow"],
     ["missing ref", { job_workflow_ref: `${path}@` }, "wrong_workflow"],
+    ["different branch", { ref: "refs/heads/main-staging" }, "wrong_ref"],
+    ["missing ref claim", { ref: undefined }, "wrong_ref"],
+    ["numeric run id", { run_id: 1234 }, "invalid_token"],
+    ["missing run id", { run_id: undefined }, "invalid_token"],
+    ["empty attempt", { run_attempt: "" }, "invalid_token"],
+    ["malformed attempt", { run_attempt: "2a" }, "invalid_token"],
+    ["missing attempt", { run_attempt: undefined }, "invalid_token"],
     ["workflow commit", { job_workflow_sha: "g".repeat(40) }, "wrong_workflow"],
   ] as const)("rejects %s", async (_label, payload, error) => {
     expect(await verifier()(await jwt(payload), env)).toEqual({ ok: false, error });
+  });
+
+  it("rejects an empty ref list and accepts another exact configured ref", async () => {
+    const verify = verifier();
+    expect(await verify(await jwt(), { ...env, ALLOWED_REFS: ", ," })).toEqual({ ok: false, error: "misconfigured" });
+    expect((await verify(await jwt({ ref: "refs/tags/recovery" }), env)).ok).toBe(true);
   });
 
   it("allows 60 seconds of clock skew for nbf and iat", async () => {

@@ -63,8 +63,8 @@ roles:
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Prices{Input: 400, Output: 2000, CacheWrite5m: 500, CacheWrite1h: 800, CacheRead: 40}
-	if prices := p.Pricing["claude-opus-5-5"]; prices != want || len(p.Pricing) != 1 {
+	want := Prices{Input: 400, Output: 2000, CacheWrite5m: 500, CacheWrite1h: 800, CacheRead: 20}
+	if prices := p.Pricing["claude-opus-5-5"]; prices != want || len(p.Pricing) != 2 {
 		t.Fatalf("unexpected pricing: %+v", p.Pricing)
 	}
 	if entries := p.Egress["content"].PathRules; len(entries) != 1 || entries[0].Host != "proxy.example.invalid" ||
@@ -74,7 +74,7 @@ roles:
 	for _, tc := range []struct{ old, replacement, want string }{
 		{"input: 400", "input: 0", "positive finite"},
 		{"output: 2000", "output: .inf", "positive finite"},
-		{"cache_read: 40", "cache_read: .nan", "positive finite"},
+		{"cache_read: 20", "cache_read: .nan", "positive finite"},
 		{"cache_write_5m: 500", "cache_write_5m: -1", "positive finite"},
 		{"cache_write_1h: 800", "", "positive finite"},
 		{"proxy.example.invalid", "Proxy.example.invalid", "lowercase hostname"},

@@ -15,7 +15,7 @@ export function agentCommand({ model, systemPromptPath, userMessage }: AgentInpu
       "claude", "--print", "--bare", "--output-format", "stream-json", "--verbose",
       "--dangerously-skip-permissions", "--no-session-persistence", "--strict-mcp-config",
       "--disable-slash-commands", "--setting-sources", "", "--tools",
-      "Bash", "Read", "Write", "Edit", "Glob", "Grep",
+      "Bash,Read,Write,Edit,Glob,Grep",
       "--model", model, "--system-prompt-file", systemPromptPath, "--", userMessage,
     ],
     env: {

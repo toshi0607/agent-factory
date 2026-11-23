@@ -53,9 +53,10 @@ describe("outbound decisions", () => {
     expect(decide(request, rules).action).toBe("allow");
   });
 
-  it("treats a rule without a trailing slash as a literal prefix", () => {
-    const customized = { ...rules, egress: [{ host: "storage.googleapis.com", path_prefixes: ["/item"] }] };
-    expect(decide(summary(storage + "/items"), customized).action).toBe("allow");
+  it("matches the directory prefix of a rule with a trailing slash", () => {
+    const customized = { ...rules, egress: [{ host: "storage.googleapis.com", path_prefixes: ["/item/"] }] };
+    expect(decide(summary(storage + "/item/file"), customized).action).toBe("allow");
+    expect(decide(summary(storage + "/items"), customized).action).toBe("deny");
     expect(decide(summary(storage + "/other"), customized).action).toBe("deny");
   });
 
@@ -70,8 +71,8 @@ function setup(refusal?: Extract<Authorization, { ok: false }>["reason"]) {
   const token = crypto.randomUUID();
   const entries: EgressEntry[] = [];
   const ledger = {
-    rules: vi.fn(() => rules),
-    authorize: vi.fn((): Authorization => refusal ? { ok: false, reason: refusal } : { ok: true, token }),
+    rules: vi.fn<OutboundLedger["rules"]>(() => rules),
+    authorize: vi.fn<OutboundLedger["authorize"]>(() => refusal ? { ok: false, reason: refusal } : { ok: true, token }),
     record: vi.fn((entry: EgressEntry) => entries.push(entry)),
     recordFailure: vi.fn(),
     meter: vi.fn<OutboundLedger["meter"]>(),
@@ -135,11 +136,11 @@ describe("outbound request handling", () => {
     const { send, upstream, ledger, entries, token, flushed } = setup();
     const payload = JSON.stringify({ usage: { input_tokens: 4, output_tokens: 7 }, other: "é" });
     upstream.mockResolvedValue(new Response(payload, { headers: { "content-type": "application/json" } }));
-    const body = JSON.stringify({ model: rules.model, max_tokens: 99 });
+    const body = `{  "model": "${rules.model}", "max_tokens": 99, "system": "あ" }\n`;
     const guest = crypto.randomUUID();
     const response = await send(llm(messages + "?beta=true", body, {
       "content-type": "application/json", accept: "application/json", "anthropic-version": "2023-06-01",
-      "anthropic-beta": "test", "user-agent": "test", "x-stainless-retry-count": "1", "x-app": "cli",
+      "anthropic-beta": "claude-code-20250219", "user-agent": "test", "x-stainless-retry-count": "1", "x-app": "cli",
       "anthropic-dangerous-direct-browser-access": "true", "accept-encoding": "gzip", "x-api-key": guest,
       authorization: `Bearer ${guest}`, cookie: guest, "proxy-authorization": guest, "x-other": guest,
     }));
@@ -151,14 +152,19 @@ describe("outbound request handling", () => {
     expect(init?.body).toEqual(new TextEncoder().encode(body));
     expect(Object.fromEntries(new Headers(init?.headers))).toEqual({
       "content-type": "application/json", accept: "application/json", "anthropic-version": "2023-06-01",
-      "anthropic-beta": "test", "user-agent": "test", "x-stainless-retry-count": "1", "x-app": "cli",
+      "anthropic-beta": "claude-code-20250219", "user-agent": "test", "x-stainless-retry-count": "1", "x-app": "cli",
       "anthropic-dangerous-direct-browser-access": "true", authorization: `Bearer ${token}`,
     });
     await flushed();
-    expect(ledger.authorize).toHaveBeenCalledWith(true);
+    const bytes = Buffer.byteLength(body);
+    const reservation = ledger.authorize.mock.calls[0]?.[0];
+    expect(reservation).toEqual({
+      request_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      estimate_microcents: Math.ceil(bytes / 3) * rules.prices.input + 99 * rules.prices.output,
+    });
     expect(ledger.meter).toHaveBeenCalledWith(
-      { tokens: expect.objectContaining({ input_tokens: 4, output_tokens: 7 }), unmetered: false, responseBytes: Buffer.byteLength(payload) },
-      expect.objectContaining({ decision: "llm", status: 200, request_bytes: body.length, model: rules.model }),
+      reservation!.request_id, { tokens: expect.objectContaining({ input_tokens: 4, output_tokens: 7 }), unmetered: false, responseBytes: Buffer.byteLength(payload) },
+      expect.objectContaining({ decision: "llm", status: 200, request_bytes: bytes, model: rules.model }),
       1,
     );
     for (const secret of [guest, token, body, payload]) expect(JSON.stringify(entries)).not.toContain(secret);
@@ -193,16 +199,21 @@ describe("outbound request handling", () => {
     expect(ledger.authorize).not.toHaveBeenCalled();
   });
 
-  it("never meters count_tokens or non-200 Messages responses", async () => {
+  it("does not reserve for count_tokens and settles failures with zero cost", async () => {
     const { send, upstream, ledger, flushed } = setup();
     upstream.mockResolvedValueOnce(Response.json({ input_tokens: 5 }));
     upstream.mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: proxy } }));
-    expect((await send(llm(messages + "/count_tokens"))).status).toBe(200);
+    upstream.mockRejectedValueOnce(new Error("upstream disconnected"));
+    expect((await send(llm(messages + "/count_tokens", JSON.stringify({ model: rules.model })))).status).toBe(200);
     expect((await send(llm())).status).toBe(302);
+    expect((await send(llm())).status).toBe(502);
     await flushed();
-    expect(ledger.authorize.mock.calls).toEqual([[false], [true]]);
-    expect(ledger.meter).not.toHaveBeenCalled();
-    expect(upstream).toHaveBeenCalledTimes(2);
+    expect(ledger.authorize.mock.calls).toEqual([[undefined], [expect.any(Object)], [expect.any(Object)]]);
+    expect(ledger.meter.mock.calls.map(([id, sample]) => [id, sample])).toEqual([
+      [ledger.authorize.mock.calls[1]![0]!.request_id, "zero"],
+      [ledger.authorize.mock.calls[2]![0]!.request_id, "zero"],
+    ]);
+    expect(upstream).toHaveBeenCalledTimes(3);
   });
 
   it("charges a fallback when a successful response has no usage, even if egress logging fails", async () => {
@@ -216,11 +227,81 @@ describe("outbound request handling", () => {
       expect(await response.json()).toEqual({ text: "unchanged" });
       await flushed();
       expect(ledger.recordFailure).toHaveBeenCalledOnce();
-      expect(ledger.meter).toHaveBeenCalledWith(expect.objectContaining({
+      expect(ledger.meter).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
         unmetered: true, tokens: expect.objectContaining({ input_tokens: Math.ceil(body.length / 3), output_tokens: 99 }),
       }), expect.any(Object), null);
     } finally {
       log.mockRestore();
     }
   });
+});
+
+it.each([messages, messages + "/count_tokens"])("enforces the body allowlist on %s", async endpoint => {
+  const { send, flushed, entries, ledger, upstream } = setup();
+  const response = await send(llm(endpoint, JSON.stringify({
+    model: rules.model, max_tokens: 99, metadata: { private_field: "private body value" },
+  })));
+  expect(response.status).toBe(403);
+  expect(response.headers.get("x-factory-denied")).toBe("llm_body");
+  expect(ledger.authorize).not.toHaveBeenCalled();
+  expect(upstream).not.toHaveBeenCalled();
+  await flushed();
+  expect(entries[0]).toMatchObject({ decision: "deny", reason: "llm_body", body_reason: "key:private_field" });
+  expect(JSON.stringify(entries)).not.toContain("private body value");
+});
+
+it("requires max_tokens for Messages and rejects nested duplicate keys", async () => {
+  const { send, ledger, entries, flushed } = setup();
+  for (const body of [
+    JSON.stringify({ model: rules.model }),
+    `{"model":"${rules.model}","max_tokens":99,"system":[{"type":"text","text":"a","text":"b"}]}`,
+  ]) {
+    const response = await send(llm(messages, body));
+    expect(response.status).toBe(403);
+    expect(response.headers.get("x-factory-denied")).toBe("llm_body");
+  }
+  expect(ledger.authorize).not.toHaveBeenCalled();
+  await flushed();
+  expect(entries.map(entry => entry.body_reason)).toEqual(["max_tokens", "duplicate_key"]);
+});
+
+it("forwards only captured beta names, bounds drop logs and omits an empty filtered header", async () => {
+  const { send, upstream, entries, flushed } = setup();
+  for (let index = 0; index < 2; index++) upstream.mockResolvedValueOnce(new Response(null, { status: 204 }));
+  const unlisted = ["x".repeat(80), ...Array.from({ length: 9 }, (_, index) => `unknown-${index}`)];
+  const allowed = ["claude-code-20250219", "thinking-display-updates-2026-08-18"];
+  await send(llm(messages, undefined, { "anthropic-beta": [allowed[0], ...unlisted, allowed[1]].join(", ") }));
+  await send(llm(messages, undefined, { "anthropic-beta": unlisted.join(", ") }));
+  expect(new Headers(upstream.mock.calls[0]?.[1]?.headers).get("anthropic-beta")).toBe(allowed.join(","));
+  expect(new Headers(upstream.mock.calls[1]?.[1]?.headers).has("anthropic-beta")).toBe(false);
+  await flushed();
+  expect(entries.map(entry => entry.beta_dropped)).toEqual(
+    [0, 1].map(() => unlisted.slice(0, 8).map(name => name.slice(0, 60))),
+  );
+});
+
+it("returns a retryable Anthropic rate limit response after all slots are taken", async () => {
+  const { send, upstream, flushed, entries } = setup("too_many_inflight");
+  const response = await send(llm());
+  expect(response.status).toBe(429);
+  expect(response.headers.get("retry-after")).toBe("5");
+  expect(response.headers.get("x-factory-denied")).toBe("too_many_inflight");
+  expect(await response.json()).toEqual({
+    type: "error", error: { type: "rate_limit_error", message: "factory: too_many_inflight" },
+  });
+  expect(upstream).not.toHaveBeenCalled();
+  await flushed();
+  expect(entries[0]).toMatchObject({ reason: "too_many_inflight", status: 429 });
+});
+
+it("denies all egress for an inactive run, including read-only hosts and token counting", async () => {
+  const { send, ledger, upstream } = setup();
+  ledger.rules.mockReturnValue("inactive");
+  for (const request of [new Request(proxy), llm(), llm(messages + "/count_tokens")]) {
+    const response = await send(request);
+    expect(response.status).toBe(403);
+    expect(response.headers.get("x-factory-denied")).toBe("run_not_running");
+  }
+  expect(upstream).not.toHaveBeenCalled();
+  expect(ledger.authorize).not.toHaveBeenCalled();
 });

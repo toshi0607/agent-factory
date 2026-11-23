@@ -15,7 +15,15 @@ pricing:
     output: 2000
     cache_write_5m: 500
     cache_write_1h: 800
-    cache_read: 40
+    cache_read: 20
+  # Haiku 5.5 has two price tiers by prompt length. The higher tier is used so
+  # the budget never undercounts.
+  claude-haiku-5-5:
+    input: 50
+    output: 250
+    cache_write_5m: 62.5
+    cache_write_1h: 100
+    cache_read: 5
 egress:
   gomod:
     allowed_hosts:

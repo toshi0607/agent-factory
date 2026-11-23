@@ -22,9 +22,10 @@ bindings.
 ## Local development
 
 `npm run dev` selects `wrangler.dev.jsonc` and `src/dev.ts`. The local driver
-sets the four OIDC vars and `DEV_JWKS` in `.dev.vars`, signs its test JWTs with
+sets the OIDC vars and `DEV_JWKS` in `.dev.vars`, signs its test JWTs with
 the corresponding private key, uploads `dev-agent.sh`, and supplies a generated
-test token. Anthropic requests receive a local SSE fixture or a count response.
+test token. The test JWTs include `ref`, `run_id`, and `run_attempt`. Local HTTP requests
+must use `localhost` or `127.0.0.1` in the Host header. Anthropic requests receive a local SSE fixture or a count response.
 The fixture returns `x-dev-saw-bearer` with `match` or `mismatch`. Allowed
 read-only hosts use ordinary upstream fetches.
 
@@ -33,8 +34,12 @@ read-only hosts use ordinary upstream fetches.
 Use `wrangler.jsonc` in a Cloudflare account with Workers, SQLite Durable
 Objects, and Containers enabled. Supply `OIDC_AUDIENCE`,
 `ALLOWED_REPOSITORY_ID`, `ALLOWED_REPOSITORY_OWNER_ID`,
-`ALLOWED_JOB_WORKFLOWS`, and `FACTORY_COMMIT` at deploy time with `--var`.
+`ALLOWED_JOB_WORKFLOWS`, `ALLOWED_REFS`, and `FACTORY_COMMIT` at deploy time with `--var`.
 Set `ALLOWED_JOB_WORKFLOWS` to comma-separated workflow paths without refs.
+Set `ALLOWED_REFS` (empty placeholder `ALLOWED_REFS=""`) to comma-separated exact
+GitHub OIDC refs such as `refs/heads/main`. The run and attempt that first
+claim a run may upload files and start it. Other authenticated callers from
+the same repository may read, refresh the token, stop, or delete it.
 The caller provides and refreshes the short-lived Claude token through
 `PUT /runs/{id}/token`. If the caller ships the current repository
 `sandbox/setup.sh`, that script also requires a Go archive in the delivery

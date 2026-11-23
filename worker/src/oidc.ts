@@ -7,7 +7,7 @@ const REFRESH_MS = 60_000;
 const RSA = "RSASSA-PKCS1-v1_5";
 
 type AuthError = "misconfigured" | "invalid_token" | "wrong_audience" | "wrong_repository"
-  | "wrong_workflow" | "expired";
+  | "wrong_workflow" | "wrong_ref" | "expired";
 
 export type Verification = { ok: true; caller: Caller } | { ok: false; error: AuthError };
 export type Verify = (authorization: string | null, env: OidcEnv) => Promise<Verification>;
@@ -31,7 +31,7 @@ function timestamp(value: unknown): value is number {
 
 function claims(payload: Record<string, unknown>, env: OidcEnv, seconds: number): Verification {
   const { iss, aud, exp, nbf, iat, repository_id, repository_owner_id,
-    job_workflow_ref, job_workflow_sha } = payload;
+    job_workflow_ref, job_workflow_sha, ref, run_id, run_attempt } = payload;
   if (iss !== ISSUER || !timestamp(exp) || !timestamp(nbf) || !timestamp(iat)
     || iat > seconds + 60 || nbf > seconds + 60 || exp <= iat || exp <= nbf || exp - iat > 3600) {
     return fail("invalid_token");
@@ -52,7 +52,12 @@ function claims(payload: Record<string, unknown>, env: OidcEnv, seconds: number)
   if (!env.ALLOWED_JOB_WORKFLOWS.split(",").some(path => path.trim() === workflowPath)) {
     return fail("wrong_workflow");
   }
-  return { ok: true, caller: { repositoryId: repository_id, workflowPath, workflowSha: job_workflow_sha } };
+  if (typeof ref !== "string" || ref === "" || !env.ALLOWED_REFS.split(",").some(value => value.trim() === ref)) {
+    return fail("wrong_ref");
+  }
+  if (typeof run_id !== "string" || !/^\d+$/.test(run_id)
+    || typeof run_attempt !== "string" || !/^\d+$/.test(run_attempt)) return fail("invalid_token");
+  return { ok: true, caller: { repositoryId: repository_id, workflowPath, workflowSha: job_workflow_sha, run_id, run_attempt } };
 }
 
 export function createVerifier(fetchJwks: () => Promise<unknown>, now = Date.now): Verify {
@@ -92,9 +97,10 @@ export function createVerifier(fetchJwks: () => Promise<unknown>, now = Date.now
 
   return async (authorization, env) => {
     const config = [env.OIDC_AUDIENCE, env.ALLOWED_REPOSITORY_ID,
-      env.ALLOWED_REPOSITORY_OWNER_ID, env.ALLOWED_JOB_WORKFLOWS];
+      env.ALLOWED_REPOSITORY_OWNER_ID, env.ALLOWED_JOB_WORKFLOWS, env.ALLOWED_REFS];
     if (config.some(value => typeof value !== "string" || value.trim() === "")
-      || !env.ALLOWED_JOB_WORKFLOWS.split(",").some(path => path.trim() !== "")) {
+      || !env.ALLOWED_JOB_WORKFLOWS.split(",").some(path => path.trim() !== "")
+      || !env.ALLOWED_REFS.split(",").some(ref => ref.trim() !== "")) {
       return fail("misconfigured");
     }
     if (!authorization || authorization.length > 32 * 1024) return fail("invalid_token");

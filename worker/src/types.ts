@@ -6,6 +6,7 @@ export interface OidcEnv {
   ALLOWED_REPOSITORY_ID: string;
   ALLOWED_REPOSITORY_OWNER_ID: string;
   ALLOWED_JOB_WORKFLOWS: string;
+  ALLOWED_REFS: string;
 }
 
 export interface Env extends OidcEnv {
@@ -20,6 +21,8 @@ export interface Caller {
   repositoryId: string;
   workflowPath: string;
   workflowSha: string;
+  run_id: string;
+  run_attempt: string;
 }
 
 export interface Prices {
@@ -40,13 +43,16 @@ export interface Rules {
   egress: EgressRule[];
 }
 
-export interface StartRequest extends Rules {
+export interface PricedRules extends Rules {
+  prices: Prices;
+}
+
+export interface StartRequest extends PricedRules {
   role: string;
   system_prompt: string;
   user_message: string;
   budget_cents: number;
   minutes: number;
-  prices: Prices;
 }
 
 export interface TokenInfo {
@@ -77,6 +83,8 @@ export interface EgressEntry {
   query_bytes: number;
   decision: "allow" | "deny" | "llm";
   reason?: string;
+  body_reason?: string;
+  beta_dropped?: string[];
   status?: number;
   request_bytes?: number;
   response_bytes?: number;
@@ -89,19 +97,26 @@ export interface EgressSummary {
   denied: number;
   llm: number;
   dropped: number;
+  dropped_deny: number;
+  dropped_other: number;
   denied_hosts: string[];
 }
 
 export interface LedgerStatus {
   token: TokenInfo;
-  usage: Usage;
+  usage: Usage & { inflight: number; late_settlements: number };
   egress: EgressSummary;
   budget_exhausted: boolean;
 }
 
+export interface Reservation {
+  request_id: string;
+  estimate_microcents: number;
+}
+
 export type Authorization =
   | { ok: true; token: string }
-  | { ok: false; reason: "no_token" | "token_expired" | "budget_exhausted" | "run_not_running" };
+  | { ok: false; reason: "no_token" | "token_expired" | "budget_exhausted" | "run_not_running" | "too_many_inflight" };
 
 export type State = "created" | "running" | "finished" | "lost" | "destroyed";
 export type RequestedStop = "time_limit" | "cancelled";

@@ -21,7 +21,7 @@ const host = z.string().max(253).regex(HOSTNAME).refine(value => {
     return false;
   }
 });
-const prefix = z.string().startsWith("/").refine(value => {
+const prefix = z.string().startsWith("/").endsWith("/").refine(value => {
   if (/[?#\\\s\u0000-\u001f\u007f]|%2[eEfF]/.test(value)) return false;
   return !value.split("/").some(segment => segment === "." || segment === "..");
 });
@@ -35,7 +35,8 @@ const startSchema = z.strictObject({
   prices: z.strictObject({
     input: price, output: price, cache_write_5m: price, cache_write_1h: price, cache_read: price,
   }),
-  egress: z.array(z.strictObject({ host, path_prefixes: z.array(prefix).min(1).optional() })).max(16),
+  egress: z.array(z.strictObject({ host, path_prefixes: z.array(prefix).min(1).optional() })).max(16)
+    .refine(rules => new Set(rules.map(rule => rule.host)).size === rules.length),
 });
 const tokenSchema = z.strictObject({
   access_token: z.string().min(20).max(4096).regex(/^[\x21-\x7e]+$/),
@@ -78,6 +79,7 @@ const messages = {
   invalid_token: "Invalid token",
   wrong_audience: "Invalid audience",
   wrong_repository: "Repository is not allowed",
+  wrong_ref: "Ref is not allowed",
   wrong_workflow: "Workflow is not allowed",
   expired: "Token expired",
 };
@@ -110,9 +112,9 @@ export function createApp({ verify }: { verify: Verify }): ExportedHandler<Env> 
         }
 
         const run = env.RUN.getByName(target.id);
-        if (!await run.claim(target.id, auth.caller)) {
-          return errorResponse(403, "forbidden", "Run belongs to a different repository");
-        }
+        const claim = await run.claim(target.id, auth.caller, target.resource === "start" || target.resource === "files");
+        if (claim === "forbidden") return errorResponse(403, claim, "Run belongs to a different repository");
+        if (claim === "wrong_run") return errorResponse(403, claim, "Run belongs to a different workflow run or attempt");
         switch (target.resource) {
           case "run": return request.method === "DELETE" ? await run.destroy() : Response.json(await run.status());
           case "egress": return await env.LEDGER.getByName(target.id).egress();

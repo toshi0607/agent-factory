@@ -22,7 +22,7 @@ export class Outbound extends ProductionOutbound {
     return async (input, init) => {
       const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
       if (url.hostname !== "api.anthropic.com") return fetch(input, init);
-      const authorization = await ledger.authorize(false);
+      const authorization = await ledger.authorize();
       const header = new Headers(init?.headers).get("authorization");
       const match = authorization.ok && header === `Bearer ${authorization.token}`;
       const headers = { "x-dev-saw-bearer": match ? "match" : "mismatch" };
@@ -47,7 +47,7 @@ export class Outbound extends ProductionOutbound {
 }
 
 let cached: { json: string; verify: Verify } | undefined;
-export default createApp({
+const app = createApp({
   verify(authorization, env) {
     const json = (env as LocalEnv).DEV_JWKS;
     if (!cached || cached.json !== json) {
@@ -56,3 +56,15 @@ export default createApp({
     return cached.verify(authorization, env);
   },
 });
+
+export default {
+  ...app,
+  fetch(request, env, ctx) {
+    const host = request.headers.get("host") ?? "";
+    const local = /^(?:127\.0\.0\.1|localhost)(?::([0-9]+))?$/i.exec(host);
+    if (!local || Number(local[1] ?? 0) > 65535) {
+      return new Response(null, { status: 404 });
+    }
+    return app.fetch!(request, env, ctx);
+  },
+} satisfies ExportedHandler<Env>;

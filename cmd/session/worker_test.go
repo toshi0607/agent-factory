@@ -161,7 +161,7 @@ roles:
  "role":"fixer","model":"claude-opus-5-5","system_prompt":%s,
  "user_message":"Set up with: bash /factory/delivery/setup.sh\nThe task is in: /factory/delivery/task.md\nWhen you are done, run: bash /factory/delivery/finish.sh\nThen reply DONE.",
  "budget_cents":299,"minutes":25,
- "prices":{"input":400,"output":2000,"cache_write_5m":500,"cache_write_1h":800,"cache_read":40},
+ "prices":{"input":400,"output":2000,"cache_write_5m":500,"cache_write_1h":800,"cache_read":20},
  "egress":[{"host":"proxy.golang.org"},{"host":"sum.golang.org"},{"host":"modules.example.invalid","path_prefixes":["/test/"]}]
 }`, jsonString(t, read(t, "prompts/fixer.md")))), &want)
 			if !reflect.DeepEqual(got, want) {
@@ -319,6 +319,16 @@ func TestWorkerStartValidation(t *testing.T) {
 	r = workerTestRunner(t, testClock(), func(w http.ResponseWriter, req *http.Request) {
 		t.Fatal("worker request sent without a model price")
 	})
+	policyData, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unpriced := strings.Replace(string(policyData), "  claude-haiku-5-5:\n", "  claude-unpriced-model:\n", 1)
+	if unpriced == string(policyData) {
+		t.Fatal("policy fixture has no Haiku pricing entry to rename")
+	}
+	cfg = filepath.Join(t.TempDir(), "policy.yaml")
+	write(t, cfg, unpriced)
 	if err := start(); err == nil || !strings.Contains(err.Error(), "pricing for model") {
 		t.Fatal("start did not require policy pricing for the role's model")
 	}

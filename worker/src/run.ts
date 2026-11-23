@@ -13,8 +13,12 @@ const ROOT = "/factory";
 const DELIVERY = `${ROOT}/delivery`;
 const TASK = `${ROOT}/task`;
 const OUT = `${ROOT}/out`;
-const PID = `${TASK}/pid`;
-const EXIT_CODE = `${TASK}/exit-code`;
+const CTL = `${ROOT}/ctl`;
+const PID = `${CTL}/pid`;
+const EXIT_CODE = `${CTL}/exit-code`;
+const CREATED_MS = 15 * 60_000;
+const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+const MAX_RESULT_BYTES = 256 * 1024;
 const TICK_MS = 30_000;
 const RETENTION_MS = 10 * 60_000;
 const INACTIVITY_MS = 15 * 60_000;
@@ -26,21 +30,24 @@ const TRUST = {
 const RUN_KEY = "run";
 const INSTANCES = ["lite", "basic", "standard-1", "standard-2", "standard-3", "standard-4"] as const;
 
-const LAUNCH = `printf '%s\\n' "$$" > ${PID} || exit 125
+const LAUNCH = `umask 022
+printf '%s\\n' "$$" > ${PID} || exit 125
 printf '%s\\n' "$$"
 IFS= read -r start && [ "$start" = go ] || exit 125
-"$@" </dev/null >${OUT}/events.jsonl 2>${OUT}/stderr.log
+/usr/bin/setpriv --reuid=agent --regid=agent --init-groups --no-new-privs /bin/bash -c \\
+  'exec "$@" </dev/null >${OUT}/events.jsonl 2>${OUT}/stderr.log' factory-command "$@"
 code=$?
 printf '%s\\n' "$code" >${EXIT_CODE}.tmp && mv -fT -- ${EXIT_CODE}.tmp ${EXIT_CODE}`;
-
-const KILL_GROUP = `kill -TERM -- "-$1" 2>/dev/null || exit 0
-sleep 5
-kill -KILL -- "-$1" 2>/dev/null || true`;
 
 interface RunData {
   id: string;
   repositoryId: string;
   workflowPath: string;
+  workflowSha?: string;
+  run_id?: string;
+  run_attempt?: string;
+  created_at?: number;
+  controlFilesProtected?: boolean;
   state: State;
   stop_reason: StopReason | null;
   started_at: string | null;
@@ -141,15 +148,30 @@ export class Run extends DurableObject<Env> {
     return agentCommand(input);
   }
 
-  claim(id: string, caller: Caller): boolean {
-    const existing = this.ctx.storage.kv.get<RunData>(RUN_KEY);
-    if (existing) return existing.repositoryId === caller.repositoryId;
-    this.#save({
-      id, repositoryId: caller.repositoryId, workflowPath: caller.workflowPath, state: "created",
-      stop_reason: null, started_at: null, finished_at: null, deadline_at: null, exit_code: null,
-      agent_result: null, budget_cents: null, minutes: null, finish_ok: null,
+  async claim(id: string, caller: Caller, changesInputs: boolean): Promise<"claimed" | "forbidden" | "wrong_run"> {
+    function check(existing: RunData): "claimed" | "forbidden" | "wrong_run" {
+      if (existing.repositoryId !== caller.repositoryId) return "forbidden";
+      if (changesInputs && (existing.run_id !== caller.run_id || existing.run_attempt !== caller.run_attempt)) {
+        return "wrong_run";
+      }
+      return "claimed";
+    }
+    const kv = this.ctx.storage.kv;
+    const existing = kv.get<RunData>(RUN_KEY);
+    if (existing) return check(existing);
+    return this.ctx.blockConcurrencyWhile(async () => {
+      const claimed = kv.get<RunData>(RUN_KEY);
+      if (claimed) return check(claimed);
+      const created_at = Date.now();
+      this.#save({
+        id, repositoryId: caller.repositoryId, workflowPath: caller.workflowPath, workflowSha: caller.workflowSha,
+        run_id: caller.run_id, run_attempt: caller.run_attempt, state: "created", created_at,
+        stop_reason: null, started_at: null, finished_at: null, deadline_at: null, exit_code: null,
+        agent_result: null, budget_cents: null, minutes: null, finish_ok: null,
+      });
+      await this.ctx.storage.setAlarm(created_at + CREATED_MS);
+      return "claimed";
     });
-    return true;
   }
 
   async token(token: string, seconds: number): Promise<Response> {
@@ -167,7 +189,7 @@ export class Run extends DurableObject<Env> {
       id, state, stop_reason, started_at, finished_at, deadline_at, exit_code, agent_result,
       usage: ledger.usage, budget_cents, minutes, egress: ledger.egress, token: ledger.token,
       container: { running: this.#container.running, instance: this.env.INSTANCE_TYPE },
-      ...this.#version(), finish_ok,
+      ...this.#version(), finish_ok, caller_workflow_sha: data.workflowSha ?? null,
     };
   }
 
@@ -231,7 +253,7 @@ export class Run extends DurableObject<Env> {
 
       const started = Date.now();
       const active: RunData = {
-        ...data, state: "running", started_at: new Date(started).toISOString(),
+        ...data, state: "running", started_at: new Date(started).toISOString(), controlFilesProtected: true,
         deadline_at: new Date(started + request.minutes * 60_000).toISOString(),
         budget_cents: request.budget_cents, minutes: request.minutes,
       };
@@ -247,7 +269,7 @@ export class Run extends DurableObject<Env> {
         await this.#launch(active, command);
       } catch {
         console.error({ event: "agent_launch_failed" });
-        await ledger.deactivate(false);
+        await this.#quiesce();
         try {
           if (this.#container.running) await this.#container.destroy();
         } catch {
@@ -262,8 +284,31 @@ export class Run extends DurableObject<Env> {
 
   async output(name: OutputName): Promise<Response> {
     if (this.#ready() && !this.#data().destroyRequested) {
-      const file = await this.#optionalFile(`${OUT}/${name}`);
-      if (file) return file;
+      const path = `${OUT}/${name}`;
+      const signal = AbortSignal.timeout(30_000);
+      try {
+        const stat = await this.#files.lstat(path, { signal });
+        if (stat.type === "file") {
+          const file = await this.#files.readFile(path, { signal });
+          const headers = new Headers(file.headers);
+          const truncated = stat.size > BigInt(MAX_OUTPUT_BYTES);
+          if (truncated) headers.set("x-factory-truncated", "1");
+          headers.delete("content-length");
+          // Fix the output length when selecting headers, even if the file grows.
+          let remaining = truncated ? MAX_OUTPUT_BYTES : Number(stat.size);
+          const body = file.body?.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+            transform(chunk, controller) {
+              const size = Math.min(chunk.byteLength, remaining);
+              if (size > 0) controller.enqueue(chunk.subarray(0, size));
+              remaining -= size;
+              if (size < chunk.byteLength || (truncated && remaining === 0)) controller.terminate();
+            },
+          }), { signal });
+          return new Response(body, { status: file.status, statusText: file.statusText, headers });
+        }
+      } catch (error) {
+        if (!missing(error)) throw error;
+      }
     }
     return errorResponse(404, "not_found", "Output not found");
   }
@@ -297,6 +342,12 @@ export class Run extends DurableObject<Env> {
         await this.#forceStop(data, data.stop_reason);
         return;
       }
+      if (data.state === "created") {
+        const expiry = (data.created_at ?? Date.now() - CREATED_MS) + CREATED_MS;
+        if (Date.now() >= expiry) await this.#destroy({ ...data, stop_reason: "cancelled", finished_at: now() });
+        else await this.ctx.storage.setAlarm(expiry);
+        return;
+      }
       if (data.state !== "running") return;
       if (data.deadline_at !== null && Date.now() >= Date.parse(data.deadline_at)) {
         await this.#forceStop(data, "time_limit");
@@ -306,10 +357,12 @@ export class Run extends DurableObject<Env> {
       if (await this.#ledger().budgetExhausted()) {
         await this.#forceStop(data, "budget_reached");
       } else if (!this.#ready() || data.group === undefined) {
+        await this.#quiesce();
         await this.#finalize(data, "lost", "lost", null, null, null);
       } else {
-        const code = await this.#exitCode();
-        if (code !== null) {
+        const code = await this.#exitCode(data);
+        if (code !== null && !await this.#groupAlive(data.group)) {
+          await this.#quiesce();
           const result = await this.#result();
           const reason = code === 0 && result?.is_error === false ? "completed" : "agent_error";
           await this.#finalize(data, "finished", reason, code, result, null);
@@ -371,7 +424,7 @@ export class Run extends DurableObject<Env> {
       await this.#container.interceptAllOutboundHttp(outbound);
       await this.#container.interceptOutboundHttps("*", outbound);
       await this.#container.setInactivityTimeout(INACTIVITY_MS);
-      const setup = await this.#exec(["install", "-d", "-o", "agent", "-g", "agent", DELIVERY, TASK, OUT], {
+      const setup = await this.#exec(["install", "-d", "-o", "agent", "-g", "agent", DELIVERY, TASK, OUT, `${ROOT}/work`], {
         user: "0:0", signal: AbortSignal.timeout(10_000), stdout: "ignore", stderr: "ignore",
       });
       if (await setup.exitCode !== 0) throw new Error("Directory setup failed");
@@ -393,7 +446,7 @@ export class Run extends DurableObject<Env> {
     });
     const launch = async () => {
       const process = await this.#exec(["setsid", "--fork", "--wait", "bash", "-c", LAUNCH, "factory-agent", ...argv], {
-        env, stdin: "pipe", stdout: "pipe", stderr: "ignore", signal: abort.signal,
+        user: "0:0", env, stdin: "pipe", stdout: "pipe", stderr: "ignore", signal: abort.signal,
       });
       void process.exitCode.catch(() => console.warn({ event: "agent_process_disconnected" }));
       const group = await processGroup(process.stdout);
@@ -426,19 +479,20 @@ export class Run extends DurableObject<Env> {
     }
   }
 
-  async #optionalFile(path: string, signal?: AbortSignal): Promise<Response | null> {
-    if (!await this.#isFile(path, signal ?? AbortSignal.timeout(5_000))) return null;
+  async #optionalFile(path: string, signal: AbortSignal): Promise<Response | null> {
+    if (!await this.#isFile(path, signal)) return null;
     try {
-      return await this.#files.readFile(path, signal ? { signal } : {});
+      return await this.#files.readFile(path, { signal });
     } catch (error) {
       if (missing(error)) return null;
       throw error;
     }
   }
 
-  async #exitCode(): Promise<number | null> {
+  async #exitCode(data: RunData): Promise<number | null> {
     try {
-      const file = await this.#optionalFile(EXIT_CODE, AbortSignal.timeout(5_000));
+      const path = data.controlFilesProtected ? EXIT_CODE : `${TASK}/exit-code`;
+      const file = await this.#optionalFile(path, AbortSignal.timeout(5_000));
       if (!file) return null;
       const text = new TextDecoder().decode(await readBytes(file.body, 16)).trim();
       const code = Number(text);
@@ -449,10 +503,46 @@ export class Run extends DurableObject<Env> {
     }
   }
 
+  async #groupAlive(group: number): Promise<boolean> {
+    const process = await this.#exec(["bash", "-c", 'kill -0 -- "-$1" 2>/dev/null', "factory-liveness", String(group)], {
+      user: "0:0", signal: AbortSignal.timeout(5_000), stdout: "ignore", stderr: "ignore",
+    });
+    const code = await process.exitCode;
+    if (code !== 0 && code !== 1) throw new Error("Process group check failed");
+    return code === 0;
+  }
+
+  async #killAgentProcesses(): Promise<void> {
+    if (!this.#container.running) return;
+    try {
+      const process = await this.#exec(["bash", "-c", "kill -KILL -1"], {
+        signal: AbortSignal.timeout(10_000), stdout: "ignore", stderr: "ignore",
+      });
+      await process.exitCode;
+    } catch {
+      console.warn({ event: "agent_kill_failed" });
+    }
+  }
+
+  async #quiesce(destroy = false): Promise<void> {
+    try {
+      await this.#ledger().deactivate(destroy);
+    } finally {
+      await this.#killAgentProcesses();
+    }
+  }
+
   async #result(): Promise<AgentResult | null> {
     try {
-      const file = await this.#optionalFile(`${OUT}/events.jsonl`, AbortSignal.timeout(10_000));
-      return await readResult(file?.body ?? null);
+      const path = `${OUT}/events.jsonl`;
+      const signal = AbortSignal.timeout(30_000);
+      if (!await this.#isFile(path, signal)) return null;
+      const process = await this.#exec(["tail", "-c", String(MAX_RESULT_BYTES), "--", path], {
+        signal, stdout: "pipe", stderr: "ignore",
+      });
+      const stream = process.stdout?.pipeThrough(new TransformStream<Uint8Array, Uint8Array>(), { signal });
+      const [result, code] = await Promise.all([readResult(stream ?? null), process.exitCode]);
+      return code === 0 ? result : null;
     } catch {
       console.warn({ event: "agent_result_read_failed" });
       return null;
@@ -466,25 +556,17 @@ export class Run extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(Date.now() + TICK_MS);
       this.#save(stopping);
     });
-    const deactivation = this.#ledger().deactivate(false).catch(() => {
-      console.warn({ event: "stop_deactivation_failed" });
-    });
+    await this.#quiesce();
 
     let finishOk: boolean | null = null;
     let code: number | null = null;
     let result: AgentResult | null = null;
     if (this.#ready()) {
-      if (data.group !== undefined) {
-        const process = await this.#exec(["bash", "-c", KILL_GROUP, "factory-stop", String(data.group)], {
-          signal: AbortSignal.timeout(10_000), stdout: "ignore", stderr: "ignore",
-        });
-        if (await process.exitCode !== 0) throw new Error("Process group stop failed");
-      }
       finishOk = await this.#finish();
-      code = await this.#exitCode();
+      if (finishOk !== null) await this.#killAgentProcesses();
+      code = await this.#exitCode(data);
       result = await this.#result();
     }
-    await deactivation;
     return this.#finalize(stopping, "finished", reason, code, result, finishOk);
   }
 
@@ -513,7 +595,6 @@ export class Run extends DurableObject<Env> {
     data: RunData, state: "finished" | "lost", reason: StopReason,
     code: number | null, result: AgentResult | null, finishOk: boolean | null,
   ): Promise<RunData> {
-    await this.#ledger().deactivate(false);
     const finished: RunData = {
       ...data, state, stop_reason: reason, exit_code: code, agent_result: result, finished_at: now(), finish_ok: finishOk,
     };
@@ -529,7 +610,7 @@ export class Run extends DurableObject<Env> {
     }
     this.#save({ ...data, destroyRequested: true });
     await this.ctx.storage.setAlarm(Date.now() + TICK_MS);
-    await this.#ledger().deactivate(true);
+    await this.#quiesce(true);
     if (this.#container.running) await this.#container.destroy();
     this.ctx.storage.kv.delete("prepared");
     this.#save({ ...data, state: "destroyed" });
