@@ -180,12 +180,15 @@ func parseFlags(f *flag.FlagSet, args []string, required ...*string) error {
 }
 
 func (r runner) authCheck(ctx context.Context, hold time.Duration) error {
-	_, firstExchanges, firstErr := r.authCheckOnce(ctx, hold > 0)
-	if hold == 0 {
-		return firstErr
+	status, firstExchanges, err := r.authCheckOnce(ctx, hold > 0)
+	if hold == 0 || err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("first auth check returned HTTP status %d, want 200", status)
 	}
 	if err := r.clock.Sleep(ctx, hold); err != nil {
-		return errors.Join(firstErr, fmt.Errorf("wait before second auth check: %w", err))
+		return fmt.Errorf("wait before second auth check: %w", err)
 	}
 	status, exchanges, err := r.authCheckOnce(ctx, true)
 	if exchanges <= firstExchanges {
@@ -194,7 +197,7 @@ func (r runner) authCheck(ctx context.Context, hold time.Duration) error {
 	if status != http.StatusOK {
 		err = errors.Join(err, fmt.Errorf("second auth check returned HTTP status %d, want 200", status))
 	}
-	return errors.Join(firstErr, err)
+	return err
 }
 
 func (r runner) authCheckOnce(ctx context.Context, includeExchanges bool) (int, int, error) {

@@ -86,6 +86,8 @@ func (r runner) collect(ctx context.Context, s state, out string) (resultErr err
 	}
 	if err == nil && stopReason == stopCompleted && lastIdleReachedBudget(events) {
 		stopReason = stopBudgetReached
+	} else if truncated && stopReason == stopCompleted {
+		notes = append(notes, "stop reason could not be confirmed from a truncated event listing")
 	}
 	final, err := r.api.GetSession(ctx, s.SessionID)
 	if err != nil {

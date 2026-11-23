@@ -3,6 +3,7 @@ package sandbox_test
 import (
 	"archive/tar"
 	"compress/gzip"
+	"encoding/base64"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -38,30 +39,82 @@ func TestProbe(t *testing.T) {
 	mkdir(t, home)
 	mkdir(t, bin)
 	const fakeSecret = "fake-secret-value-never-print"
+	const signURL = "https://signer.example/secret-path?sig=topsecret"
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"aud":"probe-audience","scope":"models:read","exp":2000000000}`))
+	token := "fake-header." + payload + ".fake-signature"
 	write(t, filepath.Join(home, ".netrc"), fakeSecret)
 	write(t, filepath.Join(home, "sample.key"), fakeSecret)
+	mkdir(t, filepath.Join(home, ".ssh"))
+	write(t, filepath.Join(home, ".ssh", "id_probe"), "PRIVATE KEY\nfile-body-marker\n")
+	argv, stdin := filepath.Join(dir, "curl-argv"), filepath.Join(dir, "curl-stdin")
 	curl := filepath.Join(bin, "curl")
 	if err := os.WriteFile(curl, []byte(`#!/bin/bash
-case ${!#} in
-  --version) printf 'curl test version\n' ;;
-  https://proxy.golang.org/|https://sum.golang.org/latest) printf 200 ;;
+printf '%s\n' "$@" >> "$CURL_ARGV"
+url=${!#}
+if [[ $url == --version ]]; then
+  printf 'curl test version\n'
+  exit 0
+fi
+while (($#)); do
+  case $1 in
+    --dump-header) dump_header=$2; shift ;;
+    --write-out) write_out=$2; shift ;;
+    --header)
+      if [[ $2 == @- ]]; then
+        while IFS= read -r line; do
+          printf '%s\n' "${line//"$ANTHROPIC_COMMIT_TOKEN"/[redacted]}"
+        done >> "$CURL_STDIN"
+        token_request=yes
+      fi
+      shift
+      ;;
+  esac
+  shift
+done
+case $url in
+  https://proxy.golang.org/|https://sum.golang.org/latest) ;;
+  https://api.anthropic.com/*|https://signer.example/*)
+    if [[ ${dump_header:-} == - ]]; then
+      server=api-test-server
+      [[ $url == https://signer.example/* ]] && server=$url
+      printf 'HTTP/1.1 200 OK\r\nServer: %s\r\nVia: test-proxy\r\nContent-Type: application/json\r\nRequest-Id: test-request\r\nSet-Cookie: fixture-cookie\r\n\r\n' "$server"
+    elif [[ ${token_request:-} != yes ]]; then
+      printf 000
+      exit 7
+    fi
+    ;;
   *) printf 000; exit 7 ;;
 esac
+printf '%b' "${write_out//'%{http_code}'/200}"
 `), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	run(t, "", nil, "bash", "-n", "probe.sh")
 	env := []string{"PATH=" + bin + ":/usr/bin:/bin", "HOME=" + home, "FACTORY_OUT_DIR=" + out,
+		"CURL_ARGV=" + argv, "CURL_STDIN=" + stdin,
 		"fAkE_TokEn=" + fakeSecret, "ALLOWED_KEY=also-a-fake-placeholder", "PROBE_ALLOWED_ENV_NAMES=ALLOWED_KEY",
-		"ANTHROPIC_COMMIT_TOKEN=" + fakeSecret, "ANTHROPIC_COMMIT_SIGN_URL=" + fakeSecret}
+		"ANTHROPIC_COMMIT_TOKEN=" + token, "ANTHROPIC_COMMIT_SIGN_URL=" + signURL}
 	for _, allowed := range []bool{false, true} {
 		if allowed {
 			env = append(env, "PROBE_ALLOWED_ENV_NAMES=ALLOWED_KEY,fAkE_TokEn")
 		}
+		write(t, argv, "")
+		write(t, stdin, "")
 		stdout := run(t, "", env, "bash", "probe.sh")
 		result := read(t, filepath.Join(out, "probe.txt"))
 		if stdout != "" || strings.Contains(result, fakeSecret) || strings.Contains(result, "also-a-fake-placeholder") {
 			t.Fatal("probe wrote unexpected output or disclosed a fake credential")
+		}
+		if strings.Contains(result, token) || strings.Contains(read(t, argv), token) {
+			t.Fatal("probe disclosed the platform token in its output or curl arguments")
+		}
+		if got := read(t, stdin); got != "Authorization: Bearer [redacted]\nx-api-key: [redacted]\n" {
+			t.Fatal("probe did not pass the platform token to curl through stdin")
+		}
+		for _, forbidden := range []string{"secret-path", "topsecret", "file-body-marker", "set-cookie", "fixture-cookie", "test-request"} {
+			if strings.Contains(result, forbidden) {
+				t.Error("probe disclosed a sign URL component, file contents, or a response header")
+			}
 		}
 		envSummary := "no_credential_env FAIL"
 		if allowed {
@@ -73,6 +126,10 @@ esac
 			"== credential-like files", "~/.netrc -> yes", "sample.key -> yes", "~/.aws -> no",
 			"== egress", "https://proxy.golang.org/ -> 200", "https://sum.golang.org/latest -> 200",
 			"https://example.com/ -> curl error 7", "https://registry.npmjs.org/ -> curl error 7",
+			"https://api.anthropic.com/ -> 200\nserver api-test-server\n",
+			"sign url (GET without the platform token) -> 200\nrequest-id present\n== platform token\n",
+			"private_key_marker yes", "scheme https\nhost signer.example\n",
+			"claims [\"aud\", \"exp\", \"scope\"]", "aud \"probe-audience\"", "scope \"models:read\"",
 			"== summary", "platform_env_present: ANTHROPIC_COMMIT_SIGN_URL ANTHROPIC_COMMIT_TOKEN",
 			envSummary, "no_credential_files FAIL", "allowed_hosts_reachable PASS",
 			"other_hosts_blocked PASS", "== done\n",
@@ -81,6 +138,21 @@ esac
 				t.Errorf("missing %q in probe result", want)
 			}
 		}
+	}
+	for _, tc := range []struct{ name, url string }{
+		{"non-https", "http://signer.example/"},
+		{"whitespace", "https://signer.example/space here"},
+		{"control character", "https://signer.example/\x01"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			write(t, argv, "")
+			run(t, "", append(env, "ANTHROPIC_COMMIT_SIGN_URL="+tc.url), "bash", "probe.sh")
+			result := read(t, filepath.Join(out, "probe.txt"))
+			if !strings.Contains(result, "sign url -> skipped (not https or contains whitespace)\n") ||
+				strings.Contains(read(t, argv), "signer.example") {
+				t.Fatal("probe did not skip an invalid sign URL")
+			}
+		})
 	}
 }
 

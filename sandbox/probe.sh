@@ -71,17 +71,17 @@ probe_ssh_directory() (
 )
 
 probe_reachability() {
-  local url=$1 response code status=0
+  local url=$1 label=${2-$1} response code status=0
   response=$(command curl --disable --silent --max-time 15 --output /dev/null \
     --dump-header - --write-out '%{http_code}\n' -- "$url") || status=$?
   code=${response##*$'\n'}
   if [[ $status != 0 || ! $code =~ ^[1-5][0-9][0-9]$ ]]; then
-    printf '%s -> curl error %s\n' "$url" "$status"
+    printf '%s -> curl error %s\n' "$label" "$status"
     return
   fi
-  printf '%s -> %s\n' "$url" "$code"
+  printf '%s -> %s\n' "$label" "$code"
   # Keep the final response block if curl also receives CONNECT or interim headers.
-  LC_ALL=C command timeout 2 awk '
+  LC_ALL=C command timeout 2 awk -v show_headers="$(( $# == 1 ))" '
     BEGIN {
       split("server via content-type x-proxy-error", allowed, " ")
       token = ENVIRON["ANTHROPIC_COMMIT_TOKEN"]
@@ -96,6 +96,7 @@ probe_reachability() {
       if (!colon) next
       name = tolower(substr($0, 1, colon - 1))
       if (name == "request-id") request_id = 1
+      if (!show_headers) next
       for (i = 1; i <= 4; i++) {
         if (name != allowed[i]) continue
         value = substr($0, colon + 1)
@@ -283,8 +284,11 @@ probe_token_request() {
     probe_reachability "$url"
   done
   if [[ ${ANTHROPIC_COMMIT_SIGN_URL+x} ]]; then
-    # The first line carries the URL; replace it so the path is not reported.
-    probe_reachability "$ANTHROPIC_COMMIT_SIGN_URL" | sed '1s|^.* -> |sign url (unauthenticated GET) -> |'
+    if [[ $ANTHROPIC_COMMIT_SIGN_URL == https://* && $ANTHROPIC_COMMIT_SIGN_URL != *[[:space:][:cntrl:]]* ]]; then
+      probe_reachability "$ANTHROPIC_COMMIT_SIGN_URL" 'sign url (GET without the platform token)'
+    else
+      printf 'sign url -> skipped (not https or contains whitespace)\n'
+    fi
   fi
 
   printf '== platform token\n'

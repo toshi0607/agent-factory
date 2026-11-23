@@ -112,14 +112,16 @@ func TestAuthCheck(t *testing.T) {
 
 func TestAuthCheckHold(t *testing.T) {
 	for _, tt := range []struct {
-		name, hold, wantError string
-		wantExchanges         []int
-		secondStatus          int
+		name, hold, wantError     string
+		wantExchanges             []int
+		firstStatus, secondStatus int
 	}{
-		{"zero", "0", "", []int{0}, 0},
-		{"refresh", "9m30s", "", []int{1, 2}, 200},
-		{"still cached", "9m", "federated token was not re-exchanged", []int{1, 1}, 200},
-		{"second status is not 200", "9m30s", "second auth check returned HTTP status 204, want 200", []int{1, 2}, 204},
+		{"zero", "0", "", []int{0}, 200, 0},
+		{"refresh", "9m30s", "", []int{1, 2}, 200, 200},
+		{"still cached", "9m", "federated token was not re-exchanged", []int{1, 1}, 200, 200},
+		{"first check errors", "9m30s", "403", []int{1}, 403, 0},
+		{"first status is not 200", "9m30s", "first auth check returned HTTP status 204, want 200", []int{1}, 204, 0},
+		{"second status is not 200", "9m30s", "second auth check returned HTTP status 204, want 200", []int{1, 2}, 200, 204},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			clock := testClock()
@@ -139,7 +141,7 @@ func TestAuthCheckHold(t *testing.T) {
 					}
 					checks++
 					if checks == 1 {
-						return 200, `{"data":[]}`
+						return tt.firstStatus, `{"data":[]}`
 					}
 					if strings.Count(stdout.String(), "\n") != 1 || len(clock.sleeps) != 1 {
 						t.Fatal("second request must follow the first JSON line and hold")
@@ -165,7 +167,7 @@ func TestAuthCheckHold(t *testing.T) {
 				t.Fatal(err)
 			}
 			var wantSleeps []time.Duration
-			if hold != 0 {
+			if len(tt.wantExchanges) == 2 {
 				wantSleeps = []time.Duration{hold}
 			}
 			if checks != len(tt.wantExchanges) || !slices.Equal(clock.sleeps, wantSleeps) {
@@ -182,7 +184,7 @@ func TestAuthCheckHold(t *testing.T) {
 					Exchanges  *int `json:"exchanges"`
 				}
 				decode(t, []byte(line), &result)
-				wantStatus := 200
+				wantStatus := tt.firstStatus
 				if len(got) == 1 {
 					wantStatus = tt.secondStatus
 				}
@@ -948,7 +950,7 @@ func TestCollectNotesAndWebToolPolicy(t *testing.T) {
 	for _, tt := range []struct{ name, wantNote string }{
 		{"list events", "could not list session events"},
 		{"save events", "could not save session events"},
-		{"truncated listings", "file listing was truncated\nevent listing was truncated"},
+		{"truncated listings", "file listing was truncated\nevent listing was truncated\nstop reason could not be confirmed from a truncated event listing"},
 		{"web tools", "policy violation: the agent used web tools"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1001,6 +1003,9 @@ func TestCollectNotesAndWebToolPolicy(t *testing.T) {
 			}
 			if cleaned != 5 || !strings.Contains(rec.Notes, tt.wantNote) || read(t, filepath.Join(out, patchName)) != "test patch" {
 				t.Fatalf("cleanup calls = %d, notes = %q", cleaned, rec.Notes)
+			}
+			if tt.name == "truncated listings" && rec.StopReason != stopCompleted {
+				t.Fatalf("stop reason = %q, want %q", rec.StopReason, stopCompleted)
 			}
 			if tt.name == "web tools" && (rec.Usage.WebFetchRequests != 2 || rec.Usage.WebSearchRequests != 3 ||
 				!strings.Contains(read(t, filepath.Join(out, "events.json")), `"data":[]`)) {
