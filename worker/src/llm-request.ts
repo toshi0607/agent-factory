@@ -11,8 +11,9 @@ export const TOOL_KEYS = new Set([
 export const TOOL_TYPES = new Set(["custom"]);
 export const TOOL_CHOICE_KEYS = new Set(["type", "name", "disable_parallel_tool_use"]);
 export const TOOL_CHOICE_TYPES = new Set(["auto", "any", "tool", "none"]);
-export const MESSAGE_KEYS = new Set(["role", "content"]);
-export const MESSAGE_ROLES = new Set(["user", "assistant"]);
+// Claude Code sends per-turn settings as a system-role message with an output_config object.
+export const MESSAGE_KEYS = new Set(["role", "content", "output_config"]);
+export const MESSAGE_ROLES = new Set(["user", "assistant", "system"]);
 export const BLOCK_TYPES = new Set(["text", "tool_use", "tool_result", "thinking", "redacted_thinking", "image", "document"]);
 export const SOURCE_TYPES = new Set(["base64", "text"]);
 export const OPAQUE_OBJECT_KEYS = ["context_management", "thinking", "output_config"] as const;
@@ -64,6 +65,7 @@ function walk(value: unknown, kind: Content, depth: number): string | undefined 
   if (kind === "content" || kind === "messages") return kind;
   if (kind === "message") {
     if (!fields || !has(MESSAGE_ROLES, fields.role)) return "message";
+    if ("output_config" in fields && !object(fields.output_config)) return "message";
     return keys(fields, MESSAGE_KEYS) ?? walk(fields.content, "content", depth + 1);
   }
   if (kind === "block") {

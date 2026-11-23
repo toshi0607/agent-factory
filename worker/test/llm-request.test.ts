@@ -68,7 +68,7 @@ it.each([
   [{ tool_choice: { type: "auto", other: true } }, "key:other"],
   [{ system: {} }, "content"],
   [{ messages: {} }, "messages"],
-  [{ messages: [{ role: "system", content: "text" }] }, "message"],
+  [{ messages: [{ role: "developer", content: "text" }] }, "message"],
   [{ messages: [{ role: "user", content: null }] }, "content"],
   [message([{}]), "block_type"],
   [message([{ type: "tool_result", content: [{}] }]), "block_type"],
@@ -112,4 +112,16 @@ it("contains exactly the eight captured beta names", () => {
   expect(filterBeta(names.join(", ") + ", EFFORT-2025-11-24")).toEqual({
     forwarded: names.join(","), dropped: ["EFFORT-2025-11-24"],
   });
+});
+
+it("accepts the per-turn system message Claude Code appends and rejects other shapes of it", () => {
+  const turns = [{ role: "user", content: [{ type: "text", text: "hello" }] }];
+  expect(validate({ messages: [...turns, { role: "system", content: [], output_config: { effort: "medium" } }] }))
+    .toEqual({ ok: true, maxTokens: undefined });
+  expect(validate({ messages: [...turns, { role: "system", content: [], output_config: "medium" }] }))
+    .toEqual({ ok: false, reason: "message" });
+  expect(validate({ messages: [...turns, { role: "system", content: [], container: {} }] }))
+    .toEqual({ ok: false, reason: "key:container" });
+  expect(validate({ messages: [...turns, { role: "developer", content: [] }] }))
+    .toEqual({ ok: false, reason: "message" });
 });
