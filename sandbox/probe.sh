@@ -282,6 +282,10 @@ probe_token_request() {
   for url in https://api.anthropic.com/ https://api.anthropic.com/v1/models https://example.com/; do
     probe_reachability "$url"
   done
+  if [[ ${ANTHROPIC_COMMIT_SIGN_URL+x} ]]; then
+    # The first line carries the URL; replace it so the path is not reported.
+    probe_reachability "$ANTHROPIC_COMMIT_SIGN_URL" | sed '1s|^.* -> |sign url (unauthenticated GET) -> |'
+  fi
 
   printf '== platform token\n'
   probe_platform_token
