@@ -22,6 +22,7 @@ import (
 const (
 	workerAlarmGrace   = 90 * time.Second
 	workerStopGrace    = 3 * time.Minute
+	workerSettleGrace  = 60 * time.Second
 	workerTokenRefresh = 240 * time.Second
 	workerLogLimit     = 20 << 20
 	workerEventLineMax = 1 << 20
@@ -47,6 +48,12 @@ func (r runner) collectWorker(ctx context.Context, s state, out string) error {
 	if err != nil {
 		return err
 	}
+	if status.Usage.Inflight != 0 {
+		status, err = r.waitWorkerSettlements(ctx, s.WorkID, status)
+		if err != nil {
+			return err
+		}
+	}
 	switch status.StopReason {
 	case stopCompleted, stopBudgetReached, stopTimeLimit, "cancelled", "agent_error", "lost":
 	default:
@@ -57,12 +64,12 @@ func (r runner) collectWorker(ctx context.Context, s state, out string) error {
 		return errors.New("worker returned invalid run timing or cost")
 	}
 
-	outputs, err := r.collectWorkerOutputs(ctx, s.WorkID, out)
+	var notes []string
+	outputs, err := r.collectWorkerOutputs(ctx, s.WorkID, out, &notes)
 	if err != nil {
 		return err
 	}
 	requiredErr := requiredWorkerOutputs(s.Role, status.StopReason, outputs)
-	var notes []string
 	if requiredErr != nil {
 		notes = append(notes, requiredErr.Error())
 	} else if s.Role == "fixer" && !outputs[pathsName] {
@@ -74,7 +81,7 @@ func (r runner) collectWorker(ctx context.Context, s state, out string) error {
 	}
 	var fetch, search int64
 	for _, name := range []string{workerEventsName, workerStderrName} {
-		present, err := r.saveWorkerOutput(ctx, s.WorkID, out, name, workerLogLimit)
+		present, err := r.saveWorkerOutput(ctx, s.WorkID, out, name, workerLogLimit, &notes)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -110,6 +117,14 @@ func (r runner) collectWorker(ctx context.Context, s state, out string) error {
 		status.Container.Instance, usage.CostMicrocents))
 	if status.AgentResult != nil && status.AgentResult.TotalCostUSD != nil {
 		notes = append(notes, fmt.Sprintf("Agent-reported total_cost_usd=%g", *status.AgentResult.TotalCostUSD))
+	}
+	if usage.Inflight != 0 {
+		notes = append(notes, fmt.Sprintf("inflight=%d", usage.Inflight))
+		interruptions.Count++
+		interruptions.Notes = append(interruptions.Notes, "Worker usage was still settling after 60 seconds.")
+	}
+	if usage.LateSettlements != 0 {
+		notes = append(notes, fmt.Sprintf("late_settlements=%d", usage.LateSettlements))
 	}
 	if status.StopReason == stopTimeLimit {
 		interruptions.Count++
@@ -219,10 +234,43 @@ func (r runner) waitWorker(ctx context.Context, s state) (cfsandbox.Status, reco
 	}
 }
 
-func (r runner) collectWorkerOutputs(ctx context.Context, id, out string) (map[string]bool, error) {
+func (r runner) waitWorkerSettlements(ctx context.Context, id string, status cfsandbox.Status) (cfsandbox.Status, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, workerSettleGrace)
+	defer cancel()
+	deadline := r.clock.Now().Add(workerSettleGrace)
+	for status.Usage.Inflight != 0 {
+		delay := min(r.pollInterval, max(0, deadline.Sub(r.clock.Now())))
+		if err := r.clock.Sleep(waitCtx, delay); err != nil {
+			if waitCtx.Err() != nil {
+				break
+			}
+			return status, err
+		}
+		if !r.clock.Now().Before(deadline) {
+			break
+		}
+		next, err := r.worker.Status(waitCtx, id)
+		if waitCtx.Err() != nil {
+			break
+		}
+		if err != nil {
+			return status, fmt.Errorf("poll worker settlements: %w", err)
+		}
+		if next.ID != id {
+			return status, errors.New("worker status returned a different run ID")
+		}
+		if next.State != "finished" && next.State != "lost" {
+			return status, errors.New("worker run is unavailable for collection")
+		}
+		status = next
+	}
+	return status, ctx.Err()
+}
+
+func (r runner) collectWorkerOutputs(ctx context.Context, id, out string, notes *[]string) (map[string]bool, error) {
 	present := make(map[string]bool, 3)
 	for _, name := range []string{patchName, pathsName, probeName} {
-		found, err := r.saveWorkerOutput(ctx, id, out, name, -1)
+		found, err := r.saveWorkerOutput(ctx, id, out, name, -1, notes)
 		if err != nil {
 			return nil, fmt.Errorf("save %s: %w", name, err)
 		}
@@ -248,13 +296,19 @@ func requiredWorkerOutputs(role, reason string, present map[string]bool) error {
 	return errors.Join(errs...)
 }
 
-func (r runner) saveWorkerOutput(ctx context.Context, id, out, name string, maxBytes int64) (bool, error) {
+func (r runner) saveWorkerOutput(ctx context.Context, id, out, name string, maxBytes int64, notes *[]string) (bool, error) {
 	path := filepath.Join(out, name)
+	var truncated bool
 	err := delivery.WriteAtomic(path, func(w io.Writer) error {
-		return r.worker.Output(ctx, id, name, w, maxBytes)
+		var err error
+		truncated, err = r.worker.Output(ctx, id, name, w, maxBytes)
+		return err
 	})
 	if cfsandbox.IsNotFound(err) {
 		return false, removeOutput(path)
+	}
+	if err == nil && truncated {
+		*notes = append(*notes, fmt.Sprintf("%s was truncated.", name))
 	}
 	return err == nil, err
 }

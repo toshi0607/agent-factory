@@ -46,7 +46,6 @@ jobs:
     with:
       factory_ref: FACTORY_SHA
       candidate: ${{ inputs.candidate }}
-      worker_url: ${{ vars.FACTORY_WORKER_URL }}
       worker_audience: ${{ vars.FACTORY_WORKER_AUDIENCE }}
       task: ${{ inputs.task }}
       role: ${{ inputs.role }}
@@ -56,3 +55,5 @@ jobs:
       organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
       service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
       workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+    secrets:
+      worker_url: ${{ secrets.FACTORY_WORKER_URL }}

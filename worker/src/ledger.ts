@@ -132,10 +132,16 @@ export class Ledger extends DurableObject<Env> {
     const now = Date.now();
     const authorization = this.ctx.storage.transactionSync((): Authorization => {
       this.#sweep(now);
-      if (kv.get("inactive") || !kv.get(RULES_KEY)) return { ok: false, reason: "run_not_running" };
+      const config = kv.get<Config>(RULES_KEY);
+      if (kv.get("inactive") || !config) return { ok: false, reason: "run_not_running" };
       if (reservation) {
-        if (this.#inflight() >= INFLIGHT_LIMIT) return { ok: false, reason: "too_many_inflight" };
+        const { count, reserved } = this.#inflight();
+        if (count >= INFLIGHT_LIMIT) return { ok: false, reason: "too_many_inflight" };
         if (this.#exhausted()) return { ok: false, reason: "budget_exhausted" };
+        const settled = kv.get<MeterTotals>(USAGE_KEY)?.usage.cost_microcents ?? 0;
+        if (count > 0 && settled + reserved + reservation.estimate_microcents > config.budgetCents * 1_000_000) {
+          return { ok: false, reason: "too_many_inflight" };
+        }
       }
       const token = this.#token.authorize(now);
       if (reservation && token.ok) {
@@ -147,8 +153,10 @@ export class Ledger extends DurableObject<Env> {
     return authorization;
   }
 
-  #inflight(): number {
-    return this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM inflight").toArray()[0]!.count;
+  #inflight(): { count: number; reserved: number } {
+    return this.ctx.storage.sql.exec<{ count: number; reserved: number }>(
+      "SELECT COUNT(*) AS count, COALESCE(SUM(estimate_microcents), 0) AS reserved FROM inflight",
+    ).toArray()[0]!;
   }
 
   #sweep(now: number): void {
@@ -283,7 +291,7 @@ export class Ledger extends DurableObject<Env> {
         token: this.tokenStatus(),
         usage: {
           ...(kv.get<MeterTotals>(USAGE_KEY)?.usage ?? ZERO_USAGE),
-          inflight: this.#inflight(), late_settlements: kv.get<number>(LATE_KEY) ?? 0,
+          inflight: this.#inflight().count, late_settlements: kv.get<number>(LATE_KEY) ?? 0,
         },
         budget_exhausted: this.#exhausted(),
         egress: { allowed, denied, llm, dropped, dropped_deny, dropped_other, denied_hosts },

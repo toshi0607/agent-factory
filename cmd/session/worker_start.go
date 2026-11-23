@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
+	"strings"
 
 	"github.com/toshi0607/agent-factory/internal/cfsandbox"
 	"github.com/toshi0607/agent-factory/internal/claudeauth"
@@ -33,6 +35,12 @@ func (r runner) workerClient() (*cfsandbox.Client, error) {
 	cfg.Audience = os.Getenv("FACTORY_WORKER_AUDIENCE")
 	if cfg.Audience == "" {
 		return nil, errors.New("FACTORY_WORKER_AUDIENCE is required for cloudflare-sandbox")
+	}
+	if audience, err := url.Parse(strings.TrimSpace(cfg.Audience)); err == nil {
+		host := strings.TrimSuffix(strings.ToLower(audience.Hostname()), ".")
+		if host == "anthropic.com" || strings.HasSuffix(host, ".anthropic.com") {
+			return nil, errors.New("FACTORY_WORKER_AUDIENCE must not use an Anthropic host")
+		}
 	}
 	client, err := cfsandbox.New(base, http.DefaultClient, cfsandbox.NewOIDCAuthenticator(http.DefaultClient, cfg))
 	if err != nil {

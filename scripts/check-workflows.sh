@@ -595,7 +595,14 @@ file=$verify_lockfile
 shopt -s nullglob
 workflows=(.github/workflows/*.yml .github/workflows/*.yaml)
 for file in "${workflows[@]}" poc/caller/*.yml poc/caller/*.yaml; do
-  if grep -Fq 'secrets.' "$file"; then
+  allowed_secret=''
+  case $file in
+    .github/workflows/p0-run.yml|.github/workflows/p0-recover.yml)
+      allowed_secret='          FACTORY_WORKER_URL: ${{ secrets.worker_url }}' ;;
+    poc/caller/factory-p0.yml|poc/caller/factory-p0-recover.yml)
+      allowed_secret='      worker_url: ${{ secrets.FACTORY_WORKER_URL }}' ;;
+  esac
+  if grep -F 'secrets.' "$file" | grep -Fvx "$allowed_secret" >/dev/null; then
     fail 'remove secrets references from the workflow'
   fi
   parse_workflow "$file" | validate_workflow

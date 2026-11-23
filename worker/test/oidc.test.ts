@@ -50,6 +50,19 @@ async function jwt(payload: Record<string, unknown> = {}, header: Record<string,
 const verifier = () => createVerifier(async () => jwks(), () => time * 1000);
 
 describe("GitHub OIDC", () => {
+  it.each([
+    ["https://", "api.anthropic.com", ""],
+    ["https://", "anthropic.com", "/token"],
+    ["https://", "API.Anthropic.COM.", ":443/token"],
+    ["//", "custom.anthropic.com", "/"],
+  ])("rejects Anthropic audience variant %# before loading keys", async (scheme, host, suffix) => {
+    const aud = scheme + host + suffix;
+    const fetcher = vi.fn(async () => jwks());
+    const verify = createVerifier(fetcher, () => time * 1000);
+    expect(await verify(await jwt({ aud }), { ...env, OIDC_AUDIENCE: aud })).toEqual({ ok: false, error: "misconfigured" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it.each([[claims.aud], [[claims.aud]]])("accepts a valid token with audience %j", async aud => {
     expect(await verifier()(await jwt({ aud }), env)).toEqual({
       ok: true, caller: {

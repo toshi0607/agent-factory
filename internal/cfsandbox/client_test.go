@@ -84,12 +84,18 @@ func TestWorkerErrorSanitizationAndRedirect(t *testing.T) {
 			fmt.Fprintf(w, `{"error":%q}`, opaque)
 		case 2:
 			http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+		case 3:
+			w.WriteHeader(401)
+			fmt.Fprint(w, `{"error":"wrong_ref"}`)
+		case 4:
+			w.WriteHeader(403)
+			fmt.Fprint(w, `{"error":"wrong_run"}`)
 		}
 	})
 	for i, want := range []struct {
 		status int
 		code   string
-	}{{400, "invalid_token_request"}, {400, ""}, {307, ""}} {
+	}{{400, "invalid_token_request"}, {400, ""}, {307, ""}, {401, "wrong_ref"}, {403, "wrong_run"}} {
 		response.Store(int32(i))
 		err := c.PutToken(t.Context(), testID, opaque, 600)
 		apiErr, ok := errors.AsType[*HTTPError](err)
@@ -215,16 +221,40 @@ func TestWorkerDownloadRetriesAndLimits(t *testing.T) {
 		return resp, err
 	})
 	var out bytes.Buffer
-	if err := c.Output(t.Context(), testID, "events.jsonl", &out, 10); err != nil || out.String() != "complete" || calls.Load() != 2 {
+	if truncated, err := c.Output(t.Context(), testID, "events.jsonl", &out, 10); err != nil || truncated || out.String() != "complete" || calls.Load() != 2 {
 		t.Fatalf("download after interrupted body = %q, requests = %d, error = %v", &out, calls.Load(), err)
 	}
 	out.Reset()
-	if err := c.Output(t.Context(), testID, "events.jsonl", &out, 7); !errors.Is(err, errOutputLimit) || out.Len() != 0 || calls.Load() != 3 {
-		t.Fatal("worker output limit was not enforced before publishing")
+	if truncated, err := c.Output(t.Context(), testID, "events.jsonl", &out, 7); err != nil || !truncated || out.String() != "complet" || calls.Load() != 3 {
+		t.Fatal("worker log was not saved at the byte limit")
+	}
+	out.Reset()
+	if _, err := c.Egress(t.Context(), testID, &out, 2); !errors.Is(err, errOutputLimit) || out.Len() != 0 {
+		t.Fatal("egress limit was not enforced before publishing")
 	}
 	dropped, err := c.Egress(t.Context(), testID, &out, 3)
 	if err != nil || dropped != 3 || out.String() != "{}\n" {
 		t.Fatalf("egress dropped = %d, error = %v", dropped, err)
+	}
+}
+
+func TestWorkerDownloadTruncatedHeader(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Factory-Truncated", "1")
+		fmt.Fprint(w, "prefix")
+	})
+	for _, name := range []string{"patch.diff", "changed-paths.txt", "events.jsonl", "stderr.log", "probe.txt"} {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			truncated, err := c.Output(t.Context(), testID, name, &out, -1)
+			if name == "patch.diff" || name == "changed-paths.txt" {
+				if err == nil || truncated || out.Len() != 0 {
+					t.Fatal("truncated patch output was accepted")
+				}
+			} else if err != nil || !truncated || out.String() != "prefix" {
+				t.Fatal("truncated diagnostic output was not saved and reported")
+			}
+		})
 	}
 }
 

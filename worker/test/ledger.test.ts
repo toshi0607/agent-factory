@@ -122,6 +122,35 @@ const reservation = (request_id: string, estimate_microcents = 1) => ({ request_
 const llm = { ...event, decision: "llm", reason: "recorded" } as const;
 
 describe("Ledger metering and authorization", () => {
+  it("serializes requests near the budget and admits a lone request above the remaining budget", async () => {
+    const { create, close } = setup();
+    try {
+      const ledger = create();
+      const { model, egress, prices } = startRequest;
+      ledger.configure({ model, egress }, prices, 1);
+      ledger.setToken(crypto.randomUUID(), 30);
+      expect((await ledger.authorize(reservation("settled", 200_000))).ok).toBe(true);
+      ledger.meter("settled", "failure", llm, null);
+
+      const next = reservation("next", 400_000);
+      const [first, blocked] = await Promise.all([ledger.authorize(reservation("first", 500_000)), ledger.authorize(next)]);
+      expect(first.ok).toBe(true);
+      expect(blocked).toEqual({ ok: false, reason: "too_many_inflight" });
+      ledger.meter("first", "zero", llm, null);
+      expect((await ledger.authorize(next)).ok).toBe(true);
+      expect((await ledger.authorize(reservation("equal", 400_000))).ok).toBe(true);
+      expect(await ledger.authorize(reservation("over"))).toEqual({ ok: false, reason: "too_many_inflight" });
+      ledger.meter("next", "zero", llm, null);
+      ledger.meter("equal", "zero", llm, null);
+
+      expect((await ledger.authorize(reservation("lone", 900_000))).ok).toBe(true);
+      ledger.meter("lone", "failure", llm, null);
+      expect(await ledger.authorize(reservation("spent"))).toEqual({ ok: false, reason: "budget_exhausted" });
+    } finally {
+      close();
+    }
+  });
+
   it("persists exact totals, denies a spent budget and clears only the credential", async () => {
     const { create, data, close } = setup();
     try {
@@ -222,7 +251,7 @@ it("sweeps persisted reservations after 20 minutes and refuses an exhausted budg
     ledger.setToken(crypto.randomUUID(), 3600);
     const start = Date.now();
     const expiry = start + 20 * 60_000;
-    await ledger.authorize(reservation("first", 1_000_000));
+    await ledger.authorize(reservation("first", 999_991));
     vi.setSystemTime(start + 10_000);
     await ledger.authorize(reservation("second", 9));
     expect(storage.setAlarm).toHaveBeenLastCalledWith(expiry);
@@ -232,11 +261,11 @@ it("sweeps persisted reservations after 20 minutes and refuses an exhausted budg
     vi.setSystemTime(expiry);
     await restarted.alarm();
     expect(storage.setAlarm).toHaveBeenLastCalledWith(expiry + 10_000);
-    expect(restarted.status().usage).toMatchObject({ inflight: 1, cost_microcents: 1_000_000, unmetered_responses: 1 });
-    expect(await restarted.authorize(reservation("denied"))).toEqual({ ok: false, reason: "budget_exhausted" });
+    expect(restarted.status().usage).toMatchObject({ inflight: 1, cost_microcents: 999_991, unmetered_responses: 1 });
     vi.setSystemTime(expiry + 10_000);
     await restarted.alarm();
-    expect(restarted.status().usage).toMatchObject({ inflight: 0, cost_microcents: 1_000_009, unmetered_responses: 2 });
+    expect(restarted.status().usage).toMatchObject({ inflight: 0, cost_microcents: 1_000_000, unmetered_responses: 2 });
+    expect(await restarted.authorize(reservation("denied"))).toEqual({ ok: false, reason: "budget_exhausted" });
   } finally {
     vi.useRealTimers();
     close();

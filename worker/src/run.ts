@@ -285,10 +285,10 @@ export class Run extends DurableObject<Env> {
   async output(name: OutputName): Promise<Response> {
     if (this.#ready() && !this.#data().destroyRequested) {
       const path = `${OUT}/${name}`;
-      const signal = AbortSignal.timeout(30_000);
       try {
-        const stat = await this.#files.lstat(path, { signal });
+        const stat = await this.#files.lstat(path, { signal: AbortSignal.timeout(5_000) });
         if (stat.type === "file") {
+          const signal = AbortSignal.timeout(10 * 60_000);
           const file = await this.#files.readFile(path, { signal });
           const headers = new Headers(file.headers);
           const truncated = stat.size > BigInt(MAX_OUTPUT_BYTES);
@@ -361,7 +361,7 @@ export class Run extends DurableObject<Env> {
         await this.#finalize(data, "lost", "lost", null, null, null);
       } else {
         const code = await this.#exitCode(data);
-        if (code !== null && !await this.#groupAlive(data.group)) {
+        if (code !== null && (data.controlFilesProtected || !await this.#groupAlive(data.group))) {
           await this.#quiesce();
           const result = await this.#result();
           const reason = code === 0 && result?.is_error === false ? "completed" : "agent_error";

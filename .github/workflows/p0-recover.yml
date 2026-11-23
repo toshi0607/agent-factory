@@ -12,9 +12,6 @@ on:
       candidate:
         type: string
         default: managed-agents
-      worker_url:
-        type: string
-        default: ''
       worker_audience:
         type: string
         default: ''
@@ -33,6 +30,9 @@ on:
       workspace_id:
         type: string
         required: true
+    secrets:
+      worker_url:
+        required: false
 
 permissions: {}
 
@@ -47,7 +47,6 @@ jobs:
     env:
       GOTOOLCHAIN: local
       GOFLAGS: -mod=readonly
-      FACTORY_WORKER_URL: ${{ inputs.worker_url }}
       FACTORY_WORKER_AUDIENCE: ${{ inputs.worker_audience }}
       ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation_rule_id }}
       ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
@@ -62,9 +61,6 @@ jobs:
           if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
             printf 'factory_ref must be a full lowercase commit SHA\n' >&2
             exit 1
-          fi
-          if [[ $FACTORY_WORKER_URL =~ ^https://([a-zA-Z0-9.-]+)(:[0-9]+)?(/|$) ]]; then
-            printf '::add-mask::%s\n' "${BASH_REMATCH[1]}"
           fi
       - name: Validate recovery inputs
         shell: bash
@@ -122,6 +118,8 @@ jobs:
           printf 'P0_STATE_PATH=%s\n' "$state" >> "$GITHUB_ENV"
       - name: Collect session outputs
         if: inputs.mode == 'collect'
+        env:
+          FACTORY_WORKER_URL: ${{ secrets.worker_url }}
         run: 'exec "$RUNNER_TEMP/bin/session" collect -state "$P0_STATE_PATH" -out "$RUNNER_TEMP/out"'
       - uses: actions/upload-artifact@v7.0.2
         if: always() && inputs.mode == 'collect'
@@ -131,4 +129,6 @@ jobs:
           if-no-files-found: warn
       - name: Clean up session
         if: inputs.mode == 'cleanup'
+        env:
+          FACTORY_WORKER_URL: ${{ secrets.worker_url }}
         run: 'exec "$RUNNER_TEMP/bin/session" cleanup -state "$P0_STATE_PATH"'

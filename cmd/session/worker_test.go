@@ -316,6 +316,18 @@ func TestWorkerStartValidation(t *testing.T) {
 	if err := start(); err == nil || !strings.Contains(err.Error(), "FACTORY_WORKER_AUDIENCE") {
 		t.Fatal("start did not require the worker audience")
 	}
+	for _, audience := range []string{
+		"https://" + "api.anthropic.com",
+		"https://" + "anthropic.com/token",
+		"https://" + "API.Anthropic.COM.:443/token",
+		"//" + "custom.anthropic.com/",
+	} {
+		t.Setenv("FACTORY_WORKER_AUDIENCE", audience)
+		if _, err := r.workerClient(); err == nil || !strings.Contains(err.Error(), "FACTORY_WORKER_AUDIENCE must not use an Anthropic host") {
+			t.Fatal("worker client did not reject an Anthropic audience")
+		}
+	}
+	t.Setenv("FACTORY_WORKER_AUDIENCE", testWorkerAudience)
 	r = workerTestRunner(t, testClock(), func(w http.ResponseWriter, req *http.Request) {
 		t.Fatal("worker request sent without a model price")
 	})
@@ -521,7 +533,7 @@ func TestWorkerMissingOutputs(t *testing.T) {
 				case "/runs/" + s.WorkID + "/egress":
 					w.Header().Set("x-egress-dropped", "0")
 				case "/runs/" + s.WorkID + "/outputs/" + workerStderrName:
-					w.Header().Set("Content-Length", fmt.Sprint(workerLogLimit+1))
+					w.WriteHeader(400)
 				default:
 					w.WriteHeader(404)
 					fmt.Fprint(w, `{"error":"not_found"}`)
@@ -529,8 +541,8 @@ func TestWorkerMissingOutputs(t *testing.T) {
 			})
 			err := r.collect(t.Context(), s, out)
 			rec, recordErr := readJSON[record.Record](filepath.Join(out, "record.partial.json"))
-			if recordErr != nil || !strings.Contains(rec.Notes, "stderr.log: worker output exceeds byte limit") {
-				t.Fatal("collector did not record that the optional log exceeded the cap")
+			if recordErr != nil || !strings.Contains(rec.Notes, "could not save stderr.log: worker: HTTP 400") {
+				t.Fatal("collector did not record the optional log download failure")
 			}
 			if tc.required != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.required+" is required") || deleted {
@@ -551,5 +563,128 @@ func TestWorkerMissingOutputs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestWorkerCollectWaitsForSettlements(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		wait      time.Duration
+		polls     int
+		remaining int
+	}{
+		{"settled", 20 * time.Second, 3, 0},
+		{"timed out", 60 * time.Second, 6, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := testClock()
+			s := sessionState(clock.Now())
+			s.Candidate = workerCandidate
+			finished := s.StartedAt.Add(time.Minute)
+			clock.now = finished
+			polls := 0
+			r := workerTestRunner(t, clock, func(w http.ResponseWriter, req *http.Request) {
+				switch req.URL.Path {
+				case "/runs/" + s.WorkID:
+					if req.Method == http.MethodDelete {
+						w.WriteHeader(204)
+						return
+					}
+					polls++
+					inflight := 2
+					if polls >= tc.polls {
+						inflight = tc.remaining
+					}
+					fmt.Fprintf(w, `{"id":%q,"state":"finished","stop_reason":"time_limit","started_at":%q,"finished_at":%q,
+						"usage":{"inflight":%d,"late_settlements":%d,"cost_microcents":%d,"output_tokens":%d}}`,
+						s.WorkID, s.StartedAt.Format(time.RFC3339), finished.Format(time.RFC3339),
+						inflight, polls, polls*1_000_000, polls)
+				case "/runs/" + s.WorkID + "/egress":
+					w.Header().Set("X-Egress-Dropped", "0")
+				default:
+					w.WriteHeader(404)
+				}
+			})
+			out := t.TempDir()
+			if err := r.collect(t.Context(), s, out); err != nil {
+				t.Fatal(err)
+			}
+			rec, err := readJSON[record.Record](filepath.Join(out, "record.partial.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if polls != tc.polls || clock.Now().Sub(finished) != tc.wait ||
+				rec.Usage.OutputTokens != int64(polls) || rec.Usage.ReportedCost.Amount != fmt.Sprint(polls) ||
+				!strings.Contains(rec.Notes, fmt.Sprintf("late_settlements=%d", polls)) {
+				t.Fatal("collector did not use the latest status within the settlement wait")
+			}
+			if tc.remaining == 0 {
+				if strings.Contains(rec.Notes, "inflight=") || rec.Interruptions.Count != 1 {
+					t.Fatal("collector recorded an interruption for settled requests")
+				}
+			} else if !strings.Contains(rec.Notes, fmt.Sprintf("inflight=%d", tc.remaining)) ||
+				rec.Interruptions.Count != 2 || !slices.Contains(rec.Interruptions.Notes, "Worker usage was still settling after 60 seconds.") {
+				t.Fatal("collector did not record the outstanding requests and interruption")
+			}
+			for _, delay := range clock.sleeps {
+				if delay != r.pollInterval {
+					t.Fatal("collector changed the polling interval while waiting for settlements")
+				}
+			}
+		})
+	}
+}
+
+func TestWorkerCollectKeepsTruncatedOutputs(t *testing.T) {
+	clock := testClock()
+	s := sessionState(clock.Now())
+	s.Role, s.Candidate = "probe", workerCandidate
+	const event = "{\"type\":\"tool_use\",\"name\":\"WebFetch\"}\n"
+	log := event + strings.Repeat("x", workerLogLimit+1-len(event))
+	base := "/runs/" + s.WorkID
+	r := workerTestRunner(t, clock, func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case base:
+			if req.Method == http.MethodDelete {
+				w.WriteHeader(204)
+				return
+			}
+			fmt.Fprintf(w, `{"id":%q,"state":"finished","stop_reason":"completed","started_at":%q,"finished_at":%q}`,
+				s.WorkID, s.StartedAt.Format(time.RFC3339), clock.Now().Format(time.RFC3339))
+		case base + "/egress":
+			w.Header().Set("X-Egress-Dropped", "0")
+		case base + "/outputs/" + probeName:
+			w.Header().Set("X-Factory-Truncated", "1")
+			fmt.Fprint(w, "probe prefix")
+		case base + "/outputs/" + workerStderrName:
+			w.Header().Set("Content-Length", fmt.Sprint(len(log)))
+			io.WriteString(w, log)
+		case base + "/outputs/" + workerEventsName:
+			io.WriteString(w, log)
+		default:
+			w.WriteHeader(404)
+		}
+	})
+	out := t.TempDir()
+	if err := r.collect(t.Context(), s, out); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := readJSON[record.Record](filepath.Join(out, "record.partial.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{probeName, workerEventsName, workerStderrName} {
+		if !strings.Contains(rec.Notes, name+" was truncated.") {
+			t.Errorf("record omitted the truncation of %s", name)
+		}
+	}
+	for _, name := range []string{workerEventsName, workerStderrName} {
+		info, err := os.Stat(filepath.Join(out, name))
+		if err != nil || info.Size() != workerLogLimit {
+			t.Errorf("collector did not keep %s at the byte limit", name)
+		}
+	}
+	if read(t, filepath.Join(out, probeName)) != "probe prefix" || rec.Usage.WebFetchRequests != 1 {
+		t.Fatal("collector did not retain the probe or count complete events in the truncated log")
 	}
 }

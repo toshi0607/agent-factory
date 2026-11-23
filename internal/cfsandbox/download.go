@@ -9,16 +9,26 @@ import (
 	"strconv"
 )
 
-func (c *Client) Output(ctx context.Context, id, name string, w io.Writer, maxBytes int64) error {
+// Output reports whether the saved output was truncated.
+func (c *Client) Output(ctx context.Context, id, name string, w io.Writer, maxBytes int64) (bool, error) {
 	if !fileName.MatchString(name) {
-		return errors.New("invalid worker output name")
+		return false, errors.New("invalid worker output name")
 	}
-	return c.download(ctx, id, "/outputs/"+name, w, maxBytes, nil)
+	keepTruncated := name == "events.jsonl" || name == "stderr.log" || name == "probe.txt"
+	var workerTruncated bool
+	truncated, err := c.download(ctx, id, "/outputs/"+name, w, maxBytes, keepTruncated, func(header http.Header) error {
+		workerTruncated = header.Get("X-Factory-Truncated") != ""
+		if workerTruncated && !keepTruncated {
+			return errors.New("worker returned a truncated output")
+		}
+		return nil
+	})
+	return err == nil && (truncated || workerTruncated), err
 }
 
 func (c *Client) Egress(ctx context.Context, id string, w io.Writer, maxBytes int64) (int, error) {
 	var dropped int
-	err := c.download(ctx, id, "/egress", w, maxBytes, func(header http.Header) error {
+	_, err := c.download(ctx, id, "/egress", w, maxBytes, false, func(header http.Header) error {
 		var err error
 		dropped, err = strconv.Atoi(header.Get("X-Egress-Dropped"))
 		if err != nil || dropped < 0 {
@@ -33,10 +43,10 @@ func (c *Client) Egress(ctx context.Context, id string, w io.Writer, maxBytes in
 }
 
 // Stage the response so a failed or retried download never writes a partial body to w.
-func (c *Client) download(ctx context.Context, id, resource string, w io.Writer, maxBytes int64, checkHeader func(http.Header) error) error {
+func (c *Client) download(ctx context.Context, id, resource string, w io.Writer, maxBytes int64, keepTruncated bool, checkHeader func(http.Header) error) (bool, error) {
 	req, err := c.newRequest(ctx, http.MethodGet, id, resource, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var staging *os.File
 	defer func() {
@@ -51,7 +61,7 @@ func (c *Client) download(ctx context.Context, id, resource string, w io.Writer,
 				return err
 			}
 		}
-		if maxBytes >= 0 && resp.ContentLength > maxBytes {
+		if !keepTruncated && maxBytes >= 0 && resp.ContentLength > maxBytes {
 			return errOutputLimit
 		}
 		if staging == nil {
@@ -70,14 +80,15 @@ func (c *Client) download(ctx context.Context, id, resource string, w io.Writer,
 		}
 		return copyResponse(staging, resp.Body, maxBytes)
 	})
-	if err != nil {
-		return err
+	truncated := keepTruncated && errors.Is(err, errOutputLimit)
+	if err != nil && !truncated {
+		return false, err
 	}
 	if _, err := staging.Seek(0, io.SeekStart); err != nil {
-		return err
+		return false, err
 	}
 	_, err = io.Copy(w, contextReader{ctx, staging})
-	return err
+	return truncated, err
 }
 
 var errOutputLimit = errors.New("worker output exceeds byte limit")

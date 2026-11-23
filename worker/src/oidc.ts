@@ -13,6 +13,16 @@ export type Verification = { ok: true; caller: Caller } | { ok: false; error: Au
 export type Verify = (authorization: string | null, env: OidcEnv) => Promise<Verification>;
 const fail = (error: AuthError): Verification => ({ ok: false, error });
 
+function isAnthropicAudience(audience: string): boolean {
+  try {
+    const value = audience.trim();
+    const host = new URL(value.startsWith("//") ? "https:" + value : value).hostname.toLowerCase().replace(/\.$/, "");
+    return host === "anthropic.com" || host.endsWith(".anthropic.com");
+  } catch {
+    return false;
+  }
+}
+
 function decode(part: string): Uint8Array {
   if (!/^[A-Za-z0-9_-]+$/.test(part)) throw new Error("invalid base64url");
   const standard = part.replaceAll("-", "+").replaceAll("_", "/");
@@ -99,6 +109,7 @@ export function createVerifier(fetchJwks: () => Promise<unknown>, now = Date.now
     const config = [env.OIDC_AUDIENCE, env.ALLOWED_REPOSITORY_ID,
       env.ALLOWED_REPOSITORY_OWNER_ID, env.ALLOWED_JOB_WORKFLOWS, env.ALLOWED_REFS];
     if (config.some(value => typeof value !== "string" || value.trim() === "")
+      || isAnthropicAudience(env.OIDC_AUDIENCE)
       || !env.ALLOWED_JOB_WORKFLOWS.split(",").some(path => path.trim() !== "")
       || !env.ALLOWED_REFS.split(",").some(ref => ref.trim() !== "")) {
       return fail("misconfigured");

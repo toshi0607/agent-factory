@@ -55,6 +55,8 @@ type Usage struct {
 	CacheCreation1hInputTokens int64 `json:"cache_creation_1h_input_tokens"`
 	CostMicrocents             int64 `json:"cost_microcents"`
 	UnmeteredResponses         int64 `json:"unmetered_responses"`
+	Inflight                   int   `json:"inflight"`
+	LateSettlements            int64 `json:"late_settlements"`
 }
 
 type Egress struct {

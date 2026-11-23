@@ -256,13 +256,29 @@ describe("Run lifecycle", () => {
     expect(storage.deleteAlarm).toHaveBeenCalled();
   });
 
-  it("ignores a forged or premature exit-code until the recorded process group exits", async () => {
+  it("ignores a legacy exit-code and trusts the protected exit-code with a live process group", async () => {
     const { run, start, toBytes, setGroupAlive, container, ledger } = fixture();
     await start();
     disk.set("/factory/task/exit-code", toBytes("0\n"));
     await run.alarm();
     expect((await run.status()).state).toBe("running");
     disk.set("/factory/ctl/exit-code", toBytes("0\n"));
+    disk.set("/factory/out/events.jsonl", toBytes('{"type":"result","is_error":false}\n'));
+    setGroupAlive(true);
+    await run.alarm();
+    expect(await run.status()).toMatchObject({ state: "finished", stop_reason: "completed" });
+    expect(container.exec.mock.calls.some(([argv]) => argv[3] === "factory-liveness")).toBe(false);
+    expect(ledger.deactivate).toHaveBeenCalledWith(false);
+    expect(container.exec.mock.calls.slice(-2).map(([argv]) => argv)).toEqual([
+      ["bash", "-c", "kill -KILL -1"], ["tail", "-c", "262144", "--", "/factory/out/events.jsonl"],
+    ]);
+  });
+
+  it("waits for the recorded process group to exit before trusting a legacy exit-code", async () => {
+    const { run, start, toBytes, setGroupAlive, container, ledger, storage } = fixture();
+    await start();
+    storage.kv.put("run", { ...storage.kv.get("run") as object, controlFilesProtected: undefined });
+    disk.set("/factory/task/exit-code", toBytes("0\n"));
     disk.set("/factory/out/events.jsonl", toBytes('{"type":"result","is_error":false}\n'));
     setGroupAlive(true);
     await run.alarm();
@@ -285,9 +301,9 @@ describe("Run lifecycle", () => {
     await upload("finish.sh");
     await start({ minutes: 1 });
     setGroupAlive(true);
-    disk.set("/factory/ctl/exit-code", toBytes("0\n"));
     await run.alarm();
     expect((await run.status()).state).toBe("running");
+    disk.set("/factory/ctl/exit-code", toBytes("0\n"));
     container.exec.mockResolvedValueOnce({ exitCode: Promise.resolve(1) });
     vi.setSystemTime(Date.now() + 60_000);
     await run.alarm();
@@ -342,12 +358,13 @@ describe("Run lifecycle", () => {
     const { run, start } = fixture();
     await start();
     const abort = new AbortController();
-    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(abort.signal);
+    const realTimeout = AbortSignal.timeout;
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => ms === 600_000 ? abort.signal : realTimeout(ms));
     const cancel = vi.fn();
     try {
       oversized.set("/factory/out/stderr.log", { size: 1n, body: new ReadableStream({ cancel }) });
       const response = await run.output("stderr.log");
-      expect(timeout).toHaveBeenCalledWith(30_000);
+      expect(timeout.mock.calls).toEqual([[5_000], [600_000]]);
       const result = response.text();
       const rejected = expect(result).rejects.toMatchObject({ name: "TimeoutError" });
       abort.abort(new DOMException("Timed out", "TimeoutError"));
@@ -369,7 +386,6 @@ describe("Run lifecycle", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const cancel = vi.fn();
     try {
-      container.exec.mockResolvedValueOnce({ exitCode: Promise.resolve(1) }); // Group is gone.
       container.exec.mockResolvedValueOnce({ exitCode: Promise.resolve(0) }); // Kill escaped processes.
       container.exec.mockImplementationOnce(async () => {
         const stdout = new ReadableStream({ cancel });

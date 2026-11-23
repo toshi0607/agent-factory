@@ -87,7 +87,8 @@ func errorCode(body io.Reader, authorization string) string {
 	}
 	switch result.Error {
 	case "misconfigured", "invalid_token", "wrong_audience", "wrong_repository", "wrong_workflow", "expired",
-		"not_found", "method_not_allowed", "forbidden", "length_required", "invalid_length", "body_too_large",
+		"wrong_ref", "wrong_run", "not_found", "method_not_allowed", "forbidden", "length_required",
+		"invalid_length", "body_too_large",
 		"invalid_start", "invalid_token_request", "invalid_stop", "internal_error", "destroyed", "length_mismatch",
 		"no_token", "missing_files", "launch_failed", "already_started":
 		return result.Error

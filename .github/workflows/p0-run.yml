@@ -12,9 +12,6 @@ on:
       candidate:
         type: string
         default: managed-agents
-      worker_url:
-        type: string
-        default: ''
       worker_audience:
         type: string
         default: ''
@@ -39,6 +36,9 @@ on:
       minutes:
         type: string
         default: ''
+    secrets:
+      worker_url:
+        required: false
 
 permissions: {}
 
@@ -126,24 +126,13 @@ jobs:
         env:
           FACTORY_REF: ${{ inputs.factory_ref }}
           CANDIDATE: ${{ inputs.candidate }}
-          FACTORY_WORKER_URL: ${{ inputs.worker_url }}
-          FACTORY_WORKER_AUDIENCE: ${{ inputs.worker_audience }}
         run: |
           if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
             printf 'factory_ref must be a full lowercase commit SHA\n' >&2
             exit 1
           fi
-          if [[ $FACTORY_WORKER_URL =~ ^https://([a-zA-Z0-9.-]+)(:[0-9]+)?(/|$) ]]; then
-            printf '::add-mask::%s\n' "${BASH_REMATCH[1]}"
-          fi
           case "$CANDIDATE" in
-            managed-agents) ;;
-            cloudflare-sandbox)
-              if [[ -z $FACTORY_WORKER_URL || -z $FACTORY_WORKER_AUDIENCE ]]; then
-                printf 'cloudflare-sandbox requires worker_url and worker_audience inputs\n' >&2
-                exit 1
-              fi
-              ;;
+            managed-agents|cloudflare-sandbox) ;;
             *)
               printf 'candidate must be managed-agents or cloudflare-sandbox\n' >&2
               exit 1
@@ -189,7 +178,7 @@ jobs:
           BUDGET_CENTS: ${{ inputs.budget_cents }}
           MINUTES: ${{ inputs.minutes }}
           PREPARE_SECONDS: ${{ needs.prepare.outputs.runner_seconds }}
-          FACTORY_WORKER_URL: ${{ inputs.worker_url }}
+          FACTORY_WORKER_URL: ${{ secrets.worker_url }}
           FACTORY_WORKER_AUDIENCE: ${{ inputs.worker_audience }}
           ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation_rule_id }}
           ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
@@ -225,7 +214,7 @@ jobs:
       - name: Clean up if start fails after creating a session
         if: failure() || cancelled()
         env:
-          FACTORY_WORKER_URL: ${{ inputs.worker_url }}
+          FACTORY_WORKER_URL: ${{ secrets.worker_url }}
           FACTORY_WORKER_AUDIENCE: ${{ inputs.worker_audience }}
           ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation_rule_id }}
           ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
@@ -247,7 +236,6 @@ jobs:
       id-token: write
       contents: read
     env:
-      FACTORY_WORKER_URL: ${{ inputs.worker_url }}
       FACTORY_WORKER_AUDIENCE: ${{ inputs.worker_audience }}
       ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation_rule_id }}
       ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
@@ -262,9 +250,6 @@ jobs:
           if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
             printf 'factory_ref must be a full lowercase commit SHA\n' >&2
             exit 1
-          fi
-          if [[ $FACTORY_WORKER_URL =~ ^https://([a-zA-Z0-9.-]+)(:[0-9]+)?(/|$) ]]; then
-            printf '::add-mask::%s\n' "${BASH_REMATCH[1]}"
           fi
       - uses: actions/checkout@v7.0.1
         with:
@@ -307,6 +292,8 @@ jobs:
           printf 'P0_STATE_PATH=%s\n' "$state" >> "$GITHUB_ENV"
       - name: Collect session outputs
         id: collect
+        env:
+          FACTORY_WORKER_URL: ${{ secrets.worker_url }}
         run: |
           exec "$RUNNER_TEMP/bin/session" collect -state "$P0_STATE_PATH" -out "$RUNNER_TEMP/out"
       - uses: actions/upload-artifact@v7.0.2
@@ -323,6 +310,8 @@ jobs:
           if-no-files-found: warn
       - name: Clean up session
         if: always() && steps.collect.outcome != 'success' && steps.collect.outcome != 'failure'
+        env:
+          FACTORY_WORKER_URL: ${{ secrets.worker_url }}
         run: |
           if [[ ! -x "$RUNNER_TEMP/bin/session" || ! -f "${P0_STATE_PATH:-}" ]]; then
             printf '%s\n' "Session binary or state unavailable. Run the \"factory-p0-recover\" workflow with this run's id to clean up."
