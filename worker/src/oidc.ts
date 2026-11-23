@@ -14,6 +14,7 @@ export type Verify = (authorization: string | null, env: OidcEnv) => Promise<Ver
 const fail = (error: AuthError): Verification => ({ ok: false, error });
 
 function isAnthropicAudience(audience: string): boolean {
+  if (audience.trim().toLowerCase().includes("anthropic.com")) return true;
   try {
     const value = audience.trim();
     const host = new URL(value.startsWith("//") ? "https:" + value : value).hostname.toLowerCase().replace(/\.$/, "");

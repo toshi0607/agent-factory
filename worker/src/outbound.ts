@@ -237,10 +237,10 @@ export async function handle(request: Request, { ledger, upstream, now, waitUnti
   }
   if (!authorization.ok) {
     const { reason } = authorization;
-    const rateLimited = reason === "too_many_inflight";
+    const rateLimited = reason === "too_many_inflight" || reason === "budget_reserved";
     const status = rateLimited ? 429 : reason === "no_token" || reason === "token_expired" ? 503 : 403;
     const headers = new Headers({ "x-factory-denied": reason });
-    if (rateLimited) headers.set("retry-after", "5");
+    if (rateLimited) headers.set("retry-after", reason === "budget_reserved" ? "2" : "5");
     return finish(Response.json({
       type: "error", error: { type: rateLimited ? "rate_limit_error" : "permission_error", message: `factory: ${reason}` },
     }, { status, headers }), { ...llmDetails, decision: "deny", reason });

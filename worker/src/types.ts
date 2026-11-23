@@ -100,11 +100,14 @@ export interface EgressSummary {
   dropped_deny: number;
   dropped_other: number;
   denied_hosts: string[];
+  throttled: number;
 }
 
 export interface LedgerStatus {
   token: TokenInfo;
-  usage: Usage & { inflight: number; late_settlements: number };
+  usage: Usage & {
+    inflight: number; late_settlements: number; reserved_microcents: number; oldest_inflight_seconds: number;
+  };
   egress: EgressSummary;
   budget_exhausted: boolean;
 }
@@ -114,9 +117,13 @@ export interface Reservation {
   estimate_microcents: number;
 }
 
+export type ThrottleReason = "too_many_inflight" | "budget_reserved";
+
+export const THROTTLE_REASONS: readonly string[] = ["too_many_inflight", "budget_reserved"] satisfies ThrottleReason[];
+
 export type Authorization =
   | { ok: true; token: string }
-  | { ok: false; reason: "no_token" | "token_expired" | "budget_exhausted" | "run_not_running" | "too_many_inflight" };
+  | { ok: false; reason: "no_token" | "token_expired" | "budget_exhausted" | "run_not_running" | ThrottleReason };
 
 export type State = "created" | "running" | "finished" | "lost" | "destroyed";
 export type RequestedStop = "time_limit" | "cancelled";

@@ -36,6 +36,9 @@ func (r runner) workerClient() (*cfsandbox.Client, error) {
 	if cfg.Audience == "" {
 		return nil, errors.New("FACTORY_WORKER_AUDIENCE is required for cloudflare-sandbox")
 	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(cfg.Audience)), "anthropic.com") {
+		return nil, errors.New("FACTORY_WORKER_AUDIENCE must not use an Anthropic host")
+	}
 	if audience, err := url.Parse(strings.TrimSpace(cfg.Audience)); err == nil {
 		host := strings.TrimSuffix(strings.ToLower(audience.Hostname()), ".")
 		if host == "anthropic.com" || strings.HasSuffix(host, ".anthropic.com") {

@@ -64,4 +64,5 @@ type Egress struct {
 	Denied      int64    `json:"denied"`
 	LLM         int64    `json:"llm"`
 	DeniedHosts []string `json:"denied_hosts"`
+	Throttled   int64    `json:"throttled"`
 }

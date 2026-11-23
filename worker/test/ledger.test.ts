@@ -72,6 +72,24 @@ describe("egress log limits", () => {
     }
   });
 
+  it("counts back-pressure refusals as throttled without logging a deny or a denied host", async () => {
+    const { create, close } = setup();
+    try {
+      // #given
+      const ledger = create();
+      const refusal = { ...event, host: "api.anthropic.com", status: 429 };
+      // #when
+      for (const reason of ["too_many_inflight", "budget_reserved"]) {
+        expect(ledger.record({ ...refusal, reason })).toBeNull();
+      }
+      // #then
+      expect(ledger.status().egress).toMatchObject({ throttled: 2, denied: 0, dropped: 0, denied_hosts: [] });
+      expect(await ledger.egress().text()).toBe("");
+    } finally {
+      close();
+    }
+  });
+
   it("never puts a credential in token status or serialization", () => {
     const memory = new TokenMemory();
     const token = crypto.randomUUID();
@@ -135,11 +153,11 @@ describe("Ledger metering and authorization", () => {
       const next = reservation("next", 400_000);
       const [first, blocked] = await Promise.all([ledger.authorize(reservation("first", 500_000)), ledger.authorize(next)]);
       expect(first.ok).toBe(true);
-      expect(blocked).toEqual({ ok: false, reason: "too_many_inflight" });
+      expect(blocked).toEqual({ ok: false, reason: "budget_reserved" });
       ledger.meter("first", "zero", llm, null);
       expect((await ledger.authorize(next)).ok).toBe(true);
       expect((await ledger.authorize(reservation("equal", 400_000))).ok).toBe(true);
-      expect(await ledger.authorize(reservation("over"))).toEqual({ ok: false, reason: "too_many_inflight" });
+      expect(await ledger.authorize(reservation("over"))).toEqual({ ok: false, reason: "budget_reserved" });
       ledger.meter("next", "zero", llm, null);
       ledger.meter("equal", "zero", llm, null);
 
@@ -190,6 +208,30 @@ describe("Ledger metering and authorization", () => {
       expect(first).toMatchObject({ response_bytes: 10, usage: { output_tokens: 1, unmetered_responses: 0 } });
       expect(second).toMatchObject({ response_bytes: 11, usage: { output_tokens: 1, unmetered_responses: 1 } });
     } finally {
+      close();
+    }
+  });
+
+  it("reports the reserved estimate and the age of the oldest reservation", async () => {
+    const { create, close } = setup();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      // #given
+      const ledger = create();
+      const { model, egress, prices } = startRequest;
+      ledger.configure({ model, egress }, prices, 1);
+      ledger.setToken(crypto.randomUUID(), 300);
+      expect(ledger.status().usage).toMatchObject({ reserved_microcents: 0, oldest_inflight_seconds: 0 });
+      const now = Date.now();
+      // #when
+      await ledger.authorize(reservation("old", 300));
+      vi.setSystemTime(now + 4_000);
+      await ledger.authorize(reservation("new", 200));
+      vi.setSystemTime(now + 7_500);
+      // #then
+      expect(ledger.status().usage).toMatchObject({ inflight: 2, reserved_microcents: 500, oldest_inflight_seconds: 7 });
+    } finally {
+      vi.useRealTimers();
       close();
     }
   });

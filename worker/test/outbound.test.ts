@@ -294,6 +294,21 @@ it("returns a retryable Anthropic rate limit response after all slots are taken"
   expect(entries[0]).toMatchObject({ reason: "too_many_inflight", status: 429 });
 });
 
+it("returns a shorter retryable rate limit while other reservations hold the remaining budget", async () => {
+  // #given
+  const { send, upstream } = setup("budget_reserved");
+  // #when
+  const response = await send(llm());
+  // #then
+  expect(response.status).toBe(429);
+  expect(response.headers.get("retry-after")).toBe("2");
+  expect(response.headers.get("x-factory-denied")).toBe("budget_reserved");
+  expect(await response.json()).toEqual({
+    type: "error", error: { type: "rate_limit_error", message: "factory: budget_reserved" },
+  });
+  expect(upstream).not.toHaveBeenCalled();
+});
+
 it("denies all egress for an inactive run, including read-only hosts and token counting", async () => {
   const { send, ledger, upstream } = setup();
   ledger.rules.mockReturnValue("inactive");

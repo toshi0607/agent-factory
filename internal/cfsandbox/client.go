@@ -22,7 +22,9 @@ import (
 const (
 	requestTimeout = 30 * time.Second
 	fileTimeout    = 5 * time.Minute
-	maxUploadBytes = 95 << 20
+	// Matches the Worker's 10-minute stream timeout for outputs and the egress log.
+	downloadTimeout = 10 * time.Minute
+	maxUploadBytes  = 95 << 20
 )
 
 var runID = regexp.MustCompile(`^p0-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$`)

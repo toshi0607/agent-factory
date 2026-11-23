@@ -23,6 +23,7 @@ const (
 	workerAlarmGrace   = 90 * time.Second
 	workerStopGrace    = 3 * time.Minute
 	workerSettleGrace  = 60 * time.Second
+	workerFinalPoll    = 30 * time.Second
 	workerTokenRefresh = 240 * time.Second
 	workerLogLimit     = 20 << 20
 	workerEventLineMax = 1 << 20
@@ -107,6 +108,11 @@ func (r runner) collectWorker(ctx context.Context, s state, out string) error {
 	}
 
 	usage := status.Usage
+	egressNotes := fmt.Sprintf("allowed=%d denied=%d llm=%d dropped=%d unmetered_responses=%d",
+		status.Egress.Allowed, status.Egress.Denied, status.Egress.LLM, dropped, usage.UnmeteredResponses)
+	if status.Egress.Throttled != 0 {
+		egressNotes += fmt.Sprintf(" throttled=%d", status.Egress.Throttled)
+	}
 	duration := status.FinishedAt.Sub(status.StartedAt).Seconds()
 	cents := usage.CostMicrocents / 1_000_000
 	if usage.CostMicrocents%1_000_000 != 0 {
@@ -154,8 +160,7 @@ func (r runner) collectWorker(ctx context.Context, s state, out string) error {
 		Interruptions: interruptions,
 		Egress: record.Egress{
 			LogAvailable: true, DeniedDestinations: append([]string{}, status.Egress.DeniedHosts...),
-			Notes: fmt.Sprintf("allowed=%d denied=%d llm=%d dropped=%d unmetered_responses=%d",
-				status.Egress.Allowed, status.Egress.Denied, status.Egress.LLM, dropped, usage.UnmeteredResponses),
+			Notes: egressNotes,
 		},
 		Patch: patch, Notes: strings.Join(notes, "\n"),
 	}
@@ -240,29 +245,30 @@ func (r runner) waitWorkerSettlements(ctx context.Context, id string, status cfs
 	deadline := r.clock.Now().Add(workerSettleGrace)
 	for status.Usage.Inflight != 0 {
 		delay := min(r.pollInterval, max(0, deadline.Sub(r.clock.Now())))
-		if err := r.clock.Sleep(waitCtx, delay); err != nil {
-			if waitCtx.Err() != nil {
-				break
-			}
+		if err := r.clock.Sleep(waitCtx, delay); err != nil && waitCtx.Err() == nil {
 			return status, err
 		}
-		if !r.clock.Now().Before(deadline) {
-			break
-		}
-		next, err := r.worker.Status(waitCtx, id)
+		final := waitCtx.Err() != nil || !r.clock.Now().Before(deadline)
+		pollCtx := waitCtx
 		if waitCtx.Err() != nil {
-			break
+			var cancelPoll context.CancelFunc
+			pollCtx, cancelPoll = context.WithTimeout(ctx, workerFinalPoll)
+			defer cancelPoll()
 		}
-		if err != nil {
-			return status, fmt.Errorf("poll worker settlements: %w", err)
+		next, err := r.worker.Status(pollCtx, id)
+		if ctx.Err() != nil || err != nil {
+			break
 		}
 		if next.ID != id {
 			return status, errors.New("worker status returned a different run ID")
 		}
 		if next.State != "finished" && next.State != "lost" {
-			return status, errors.New("worker run is unavailable for collection")
+			break
 		}
 		status = next
+		if final {
+			break
+		}
 	}
 	return status, ctx.Err()
 }

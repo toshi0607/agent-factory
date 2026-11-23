@@ -55,6 +55,9 @@ describe("GitHub OIDC", () => {
     ["https://", "anthropic.com", "/token"],
     ["https://", "API.Anthropic.COM.", ":443/token"],
     ["//", "custom.anthropic.com", "/"],
+    ["", "api.anthropic.com", ""],
+    ["", "api.anthropic.com", ":443"],
+    ["urn:", "Anthropic.com", ""],
   ])("rejects Anthropic audience variant %# before loading keys", async (scheme, host, suffix) => {
     const aud = scheme + host + suffix;
     const fetcher = vi.fn(async () => jwks());

@@ -321,6 +321,9 @@ func TestWorkerStartValidation(t *testing.T) {
 		"https://" + "anthropic.com/token",
 		"https://" + "API.Anthropic.COM.:443/token",
 		"//" + "custom.anthropic.com/",
+		"api." + "anthropic.com",
+		"api." + "anthropic.com:443",
+		"urn:" + "Anthropic.com",
 	} {
 		t.Setenv("FACTORY_WORKER_AUDIENCE", audience)
 		if _, err := r.workerClient(); err == nil || !strings.Contains(err.Error(), "FACTORY_WORKER_AUDIENCE must not use an Anthropic host") {
@@ -574,7 +577,7 @@ func TestWorkerCollectWaitsForSettlements(t *testing.T) {
 		remaining int
 	}{
 		{"settled", 20 * time.Second, 3, 0},
-		{"timed out", 60 * time.Second, 6, 2},
+		{"timed out", 60 * time.Second, 7, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clock := testClock()
@@ -630,6 +633,62 @@ func TestWorkerCollectWaitsForSettlements(t *testing.T) {
 				if delay != r.pollInterval {
 					t.Fatal("collector changed the polling interval while waiting for settlements")
 				}
+			}
+		})
+	}
+}
+
+func TestWorkerCollectKeepsLastStatusWhenSettlementPollFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fail func(w http.ResponseWriter)
+	}{
+		{"poll error", func(w http.ResponseWriter) { w.WriteHeader(http.StatusBadRequest) }},
+		{"unexpected state", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := testClock()
+			s := sessionState(clock.Now())
+			s.Candidate = workerCandidate
+			finished := s.StartedAt.Add(time.Minute)
+			clock.now = finished
+			polls := 0
+			r := workerTestRunner(t, clock, func(w http.ResponseWriter, req *http.Request) {
+				switch req.URL.Path {
+				case "/runs/" + s.WorkID:
+					if req.Method == http.MethodDelete {
+						w.WriteHeader(204)
+						return
+					}
+					polls++
+					state := "finished"
+					if polls > 1 {
+						if tc.fail != nil {
+							tc.fail(w)
+							return
+						}
+						state = "destroyed"
+					}
+					fmt.Fprintf(w, `{"id":%q,"state":%q,"stop_reason":"time_limit","started_at":%q,"finished_at":%q,
+						"usage":{"inflight":3,"cost_microcents":1000000,"output_tokens":%d},"egress":{"throttled":4}}`,
+						s.WorkID, state, s.StartedAt.Format(time.RFC3339), finished.Format(time.RFC3339), polls)
+				case "/runs/" + s.WorkID + "/egress":
+					w.Header().Set("X-Egress-Dropped", "0")
+				default:
+					w.WriteHeader(404)
+				}
+			})
+			out := t.TempDir()
+			if err := r.collect(t.Context(), s, out); err != nil {
+				t.Fatal(err)
+			}
+			rec, err := readJSON[record.Record](filepath.Join(out, "record.partial.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if polls != 2 || rec.Usage.OutputTokens != 1 || !strings.Contains(rec.Notes, "inflight=3") ||
+				!strings.HasSuffix(rec.Egress.Notes, " throttled=4") {
+				t.Fatal("collector did not keep the last good status after a failed settlement poll")
 			}
 		})
 	}

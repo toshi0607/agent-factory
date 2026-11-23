@@ -55,7 +55,7 @@ func (c *Client) download(ctx context.Context, id, resource string, w io.Writer,
 			os.Remove(staging.Name())
 		}
 	}()
-	err = c.send(req, http.StatusOK, 5, fileTimeout, func(resp *http.Response) error {
+	err = c.send(req, http.StatusOK, 5, downloadTimeout, func(resp *http.Response) error {
 		if checkHeader != nil {
 			if err := checkHeader(resp.Header); err != nil {
 				return err

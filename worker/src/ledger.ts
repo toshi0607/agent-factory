@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-import type {
-  Authorization, EgressEntry, EgressSummary, Env, LedgerStatus, PricedRules, Prices, Reservation, Rules, TokenInfo, Usage,
+import {
+  THROTTLE_REASONS, type Authorization, type EgressEntry, type EgressSummary, type Env, type LedgerStatus,
+  type PricedRules, type Prices, type Reservation, type Rules, type TokenInfo, type Usage,
 } from "./types";
 import { exactCost, jsonInteger, microcents, type Settlement, ZERO_USAGE } from "./usage";
 
@@ -14,7 +15,7 @@ const USAGE_KEY = "usage";
 const RULES_KEY = "rules";
 const LATE_KEY = "late_settlements";
 const EMPTY_EGRESS: EgressSummary = {
-  allowed: 0, denied: 0, llm: 0, dropped: 0, dropped_deny: 0, dropped_other: 0, denied_hosts: [],
+  allowed: 0, denied: 0, llm: 0, dropped: 0, dropped_deny: 0, dropped_other: 0, denied_hosts: [], throttled: 0,
 };
 
 interface EgressCounters extends EgressSummary {
@@ -26,6 +27,10 @@ export function countEgress(
   current: EgressCounters | undefined, entry: EgressEntry, canStore = true,
 ): EgressCounters {
   const next = { ...(current ?? { ...EMPTY_EGRESS, stored: 0, stored_deny: 0 }) };
+  if (entry.decision === "deny" && entry.reason !== undefined && THROTTLE_REASONS.includes(entry.reason)) {
+    next.throttled = (next.throttled ?? 0) + 1;
+    return next;
+  }
   if (entry.decision === "deny") {
     next.denied += 1;
     if (entry.host && next.denied_hosts.length < DENIED_HOST_LIMIT && !next.denied_hosts.includes(entry.host)) {
@@ -140,7 +145,7 @@ export class Ledger extends DurableObject<Env> {
         if (this.#exhausted()) return { ok: false, reason: "budget_exhausted" };
         const settled = kv.get<MeterTotals>(USAGE_KEY)?.usage.cost_microcents ?? 0;
         if (count > 0 && settled + reserved + reservation.estimate_microcents > config.budgetCents * 1_000_000) {
-          return { ok: false, reason: "too_many_inflight" };
+          return { ok: false, reason: "budget_reserved" };
         }
       }
       const token = this.#token.authorize(now);
@@ -153,9 +158,10 @@ export class Ledger extends DurableObject<Env> {
     return authorization;
   }
 
-  #inflight(): { count: number; reserved: number } {
-    return this.ctx.storage.sql.exec<{ count: number; reserved: number }>(
-      "SELECT COUNT(*) AS count, COALESCE(SUM(estimate_microcents), 0) AS reserved FROM inflight",
+  #inflight(): { count: number; reserved: number; oldest: number | null } {
+    return this.ctx.storage.sql.exec<{ count: number; reserved: number; oldest: number | null }>(
+      `SELECT COUNT(*) AS count, COALESCE(SUM(estimate_microcents), 0) AS reserved, MIN(started_at) AS oldest
+       FROM inflight`,
     ).toArray()[0]!;
   }
 
@@ -283,18 +289,22 @@ export class Ledger extends DurableObject<Env> {
 
   status(): LedgerStatus {
     return this.ctx.storage.transactionSync(() => {
-      this.#sweep(Date.now());
+      const now = Date.now();
+      this.#sweep(now);
       const kv = this.ctx.storage.kv;
-      const { allowed, denied, llm, dropped, dropped_deny, dropped_other, denied_hosts } =
+      const { allowed, denied, llm, dropped, dropped_deny, dropped_other, denied_hosts, throttled } =
         kv.get<EgressCounters>(SUMMARY_KEY) ?? EMPTY_EGRESS;
+      const inflight = this.#inflight();
       return {
         token: this.tokenStatus(),
         usage: {
           ...(kv.get<MeterTotals>(USAGE_KEY)?.usage ?? ZERO_USAGE),
-          inflight: this.#inflight().count, late_settlements: kv.get<number>(LATE_KEY) ?? 0,
+          inflight: inflight.count, late_settlements: kv.get<number>(LATE_KEY) ?? 0,
+          reserved_microcents: inflight.reserved,
+          oldest_inflight_seconds: inflight.oldest === null ? 0 : Math.max(0, Math.floor((now - inflight.oldest) / 1000)),
         },
         budget_exhausted: this.#exhausted(),
-        egress: { allowed, denied, llm, dropped, dropped_deny, dropped_other, denied_hosts },
+        egress: { allowed, denied, llm, dropped, dropped_deny, dropped_other, denied_hosts, throttled: throttled ?? 0 },
       };
     });
   }
