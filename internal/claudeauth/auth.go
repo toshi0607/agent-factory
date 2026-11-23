@@ -108,6 +108,26 @@ func (f *Federation) Authorize(ctx context.Context, req *http.Request) error {
 	return nil
 }
 
+// Token returns a federated token with at least five minutes of remaining life.
+func (f *Federation) Token(ctx context.Context) (string, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+	const minimum = 5 * time.Minute
+	if f.token == "" || f.expiresAt.Sub(f.now()) < minimum {
+		if err := f.refresh(ctx); err != nil {
+			return "", 0, err
+		}
+	}
+	remaining := f.expiresAt.Sub(f.now())
+	if remaining < minimum {
+		return "", 0, errors.New("federated token has less than five minutes remaining")
+	}
+	return f.token, int(remaining / time.Second), nil
+}
+
 // Info returns metadata from the most recent successful exchange and the total exchange count.
 func (f *Federation) Info() (TokenInfo, bool) {
 	f.mu.Lock()

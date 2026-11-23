@@ -3,6 +3,12 @@ name: Run Agent Factory P0
 on:
   workflow_dispatch:
     inputs:
+      candidate:
+        type: choice
+        default: managed-agents
+        options:
+          - managed-agents
+          - cloudflare-sandbox
       task:
         type: choice
         required: true
@@ -39,6 +45,9 @@ jobs:
     uses: toshi0607/agent-factory/.github/workflows/p0-run.yml@FACTORY_SHA
     with:
       factory_ref: FACTORY_SHA
+      candidate: ${{ inputs.candidate }}
+      worker_url: ${{ vars.FACTORY_WORKER_URL }}
+      worker_audience: ${{ vars.FACTORY_WORKER_AUDIENCE }}
       task: ${{ inputs.task }}
       role: ${{ inputs.role }}
       budget_cents: ${{ inputs.budget_cents }}

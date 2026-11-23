@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/toshi0607/agent-factory/internal/cfsandbox"
 	"github.com/toshi0607/agent-factory/internal/claude"
 	"github.com/toshi0607/agent-factory/internal/delivery"
 	"github.com/toshi0607/agent-factory/internal/policy"
@@ -26,8 +27,15 @@ const (
 )
 
 func (r runner) start(ctx context.Context, policyPath, roleName, candidate, files, statePath string, budgetCents, minutes int) (resultErr error) {
-	if candidate != "managed-agents" {
+	if candidate != "managed-agents" && candidate != workerCandidate {
 		return fmt.Errorf("unsupported candidate %q", candidate)
+	}
+	if candidate == workerCandidate {
+		client, err := r.workerClient()
+		if err != nil {
+			return err
+		}
+		r.worker = client
 	}
 	cfg, err := policy.Load(policyPath)
 	if err != nil {
@@ -70,6 +78,13 @@ func (r runner) start(ctx context.Context, policyPath, roleName, candidate, file
 	}) {
 		return errors.New("manifest is missing " + probeScriptName)
 	}
+	var workerRequest cfsandbox.StartRequest
+	if candidate == workerCandidate {
+		workerRequest, err = makeWorkerRequest(cfg, role, roleName, string(system), budgetCents, minutes)
+		if err != nil {
+			return err
+		}
+	}
 
 	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
 		return err
@@ -77,6 +92,9 @@ func (r runner) start(ctx context.Context, policyPath, roleName, candidate, file
 	var suffix [4]byte
 	rand.Read(suffix[:])
 	workID := fmt.Sprintf("p0-%s-%x", r.clock.Now().UTC().Format("20060102T150405Z"), suffix)
+	if candidate == workerCandidate && !cfsandbox.ValidRunID(workID) {
+		return errors.New("generated an invalid worker run ID")
+	}
 	s := state{
 		WorkID: workID, Candidate: candidate, Role: roleName, Task: manifest.Task,
 		BaseCommit: manifest.BaseCommit, FactoryCommit: os.Getenv("FACTORY_COMMIT"), Model: role.Model,
@@ -93,6 +111,9 @@ func (r runner) start(ctx context.Context, policyPath, roleName, candidate, file
 			resultErr = errors.Join(resultErr, r.cleanupAfterRun(ctx, s, "", false))
 		}
 	}()
+	if candidate == workerCandidate {
+		return r.startWorker(ctx, root, manifest, manifestData, cfg.Toolchain.Go.Filename, workerRequest, s, statePath)
+	}
 
 	// Some failed API calls still return an ID for a resource that needs cleanup.
 	saveState := func(id string, apiErr error) error {
@@ -205,29 +226,43 @@ func parseManifest(data []byte, goTool policy.Go) (delivery.Manifest, error) {
 }
 
 func (r runner) uploadPrepared(ctx context.Context, root *os.Root, entry delivery.File) (claude.File, error) {
-	info, err := root.Lstat(entry.Name)
-	if err != nil {
-		return claude.File{}, err
-	}
-	if !info.Mode().IsRegular() {
-		return claude.File{}, errors.New("delivery file must be a regular file")
-	}
-	f, err := root.Open(entry.Name)
+	f, err := openPrepared(root, entry)
 	if err != nil {
 		return claude.File{}, err
 	}
 	defer f.Close()
+	return r.api.UploadFile(ctx, entry.Name, f)
+}
+
+func openPrepared(root *os.Root, entry delivery.File) (*os.File, error) {
+	info, err := root.Lstat(entry.Name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("delivery file must be a regular file")
+	}
+	f, err := root.Open(entry.Name)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyPrepared(f, entry); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func verifyPrepared(f *os.File, entry delivery.File) error {
 	hash, size, err := delivery.Digest(f)
 	if err != nil {
-		return claude.File{}, err
+		return err
 	}
 	if !strings.EqualFold(hash, entry.SHA256) || size != entry.Bytes {
-		return claude.File{}, errors.New("delivery file checksum or size differs from manifest")
+		return errors.New("delivery file checksum or size differs from manifest")
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return claude.File{}, err
-	}
-	return r.api.UploadFile(ctx, entry.Name, f)
+	_, err = f.Seek(0, io.SeekStart)
+	return err
 }
 
 func fileResource(name, id string) claude.Resource {
@@ -258,5 +293,9 @@ func userMessage(resources []claude.Resource, ids map[string]string, probe bool)
 	if probe && paths[probeScriptName] != path.Join(path.Dir(setup), probeScriptName) {
 		return "", errors.New("session response must mount probe.sh next to setup.sh")
 	}
-	return fmt.Sprintf("Set up with: bash %s\nThe task is in: %s\nWhen you are done, run: bash %s\nThen reply DONE.", setup, task, finish), nil
+	return formatUserMessage(setup, task, finish), nil
+}
+
+func formatUserMessage(setup, task, finish string) string {
+	return fmt.Sprintf("Set up with: bash %s\nThe task is in: %s\nWhen you are done, run: bash %s\nThen reply DONE.", setup, task, finish)
 }

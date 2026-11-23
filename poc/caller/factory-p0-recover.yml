@@ -3,6 +3,12 @@ name: factory-p0-recover
 on:
   workflow_dispatch:
     inputs:
+      candidate:
+        type: choice
+        default: managed-agents
+        options:
+          - managed-agents
+          - cloudflare-sandbox
       run_id:
         description: Earlier P0 workflow run ID
         type: string
@@ -28,6 +34,9 @@ jobs:
       run_id: ${{ inputs.run_id }}
       mode: ${{ inputs.mode }}
       factory_ref: FACTORY_SHA
+      candidate: ${{ inputs.candidate }}
+      worker_url: ${{ vars.FACTORY_WORKER_URL }}
+      worker_audience: ${{ vars.FACTORY_WORKER_AUDIENCE }}
       federation_rule_id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
       organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
       service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}

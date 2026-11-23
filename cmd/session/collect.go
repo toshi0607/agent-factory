@@ -40,6 +40,9 @@ func validMinutes(minutes int) bool {
 const recoveryHint = `run the "factory-p0-recover" workflow with this run's id to collect again or clean up`
 
 func (r runner) collect(ctx context.Context, s state, out string) (resultErr error) {
+	if s.Candidate == workerCandidate {
+		return r.collectWorker(ctx, s, out)
+	}
 	start := r.clock.Now()
 	var session claude.Session
 	var stopReason string
@@ -312,15 +315,18 @@ func (r runner) collectOutputs(ctx context.Context, s state, out string) (record
 		}
 	}
 
-	patchPath := filepath.Join(out, patchName)
-	pathsPath := filepath.Join(out, pathsName)
 	for _, name := range []string{patchName, pathsName, probeName} {
 		if err := r.saveOutput(ctx, files[name], filepath.Join(out, name)); err != nil {
 			return patch, nil, fmt.Errorf("save %s: %w", name, err)
 		}
 	}
-	if files[pathsName] != "" {
-		data, err := os.ReadFile(pathsPath)
+	return inspectOutputs(out, files[patchName] != "", files[pathsName] != "", notes)
+}
+
+func inspectOutputs(out string, hasPatch, hasPaths bool, notes []string) (record.Patch, []string, error) {
+	patch := record.Patch{Paths: []string{}}
+	if hasPaths {
+		data, err := os.ReadFile(filepath.Join(out, pathsName))
 		if err != nil {
 			return patch, nil, err
 		}
@@ -330,10 +336,10 @@ func (r runner) collectOutputs(ctx context.Context, s state, out string) (record
 			}
 		}
 	}
-	if files[patchName] == "" {
+	if !hasPatch {
 		return patch, append(notes, "patch.diff was not found in session outputs."), nil
 	}
-	info, err := delivery.Inspect(patchPath)
+	info, err := delivery.Inspect(filepath.Join(out, patchName))
 	if err != nil {
 		return patch, nil, err
 	}
@@ -390,10 +396,14 @@ func (r runner) outputFiles(ctx context.Context, id string) (map[string]string, 
 
 func (r runner) saveOutput(ctx context.Context, id, path string) error {
 	if id == "" {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		return nil
+		return removeOutput(path)
 	}
 	return delivery.WriteAtomic(path, func(w io.Writer) error { return r.api.DownloadFile(ctx, id, w) })
+}
+
+func removeOutput(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }

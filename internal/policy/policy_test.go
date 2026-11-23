@@ -46,3 +46,50 @@ func TestInvalidPolicies(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkerPolicy(t *testing.T) {
+	data, err := os.ReadFile("../../policy/google-cloud-emulator.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := strings.Replace(string(data), "roles:\n", `  content:
+    path_rules:
+      - host: proxy.example.invalid
+        path_prefixes: [/modules/, /checksums/]
+roles:
+`, 1)
+	valid = strings.Replace(valid, "egress: [gomod]", "egress: [gomod, content]", 1)
+	p, err := decode(strings.NewReader(valid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Prices{Input: 400, Output: 2000, CacheWrite5m: 500, CacheWrite1h: 800, CacheRead: 40}
+	if prices := p.Pricing["claude-opus-5-5"]; prices != want || len(p.Pricing) != 1 {
+		t.Fatalf("unexpected pricing: %+v", p.Pricing)
+	}
+	if entries := p.Egress["content"].PathRules; len(entries) != 1 || entries[0].Host != "proxy.example.invalid" ||
+		strings.Join(entries[0].PathPrefixes, " ") != "/modules/ /checksums/" {
+		t.Fatalf("unexpected path rules: %+v", p.Egress["content"])
+	}
+	for _, tc := range []struct{ old, replacement, want string }{
+		{"input: 400", "input: 0", "positive finite"},
+		{"output: 2000", "output: .inf", "positive finite"},
+		{"cache_read: 40", "cache_read: .nan", "positive finite"},
+		{"cache_write_5m: 500", "cache_write_5m: -1", "positive finite"},
+		{"cache_write_1h: 800", "", "positive finite"},
+		{"proxy.example.invalid", "Proxy.example.invalid", "lowercase hostname"},
+		{"proxy.golang.org", "proxy.golang.org:443", "lowercase hostname"},
+		{"proxy.example.invalid", "127.0.0.1", "lowercase hostname"},
+		{"[/modules/, /checksums/]", "[modules/]", "must start with /"},
+		{"[/modules/, /checksums/]", "[]", "path prefixes"},
+		{"proxy.example.invalid", "proxy.golang.org", "appears in both"},
+		{"  content:\n", "  content:\n    allowed_hosts: [proxy.example.invalid]\n", "appears in both"},
+	} {
+		t.Run(tc.replacement, func(t *testing.T) {
+			_, err := decode(strings.NewReader(strings.Replace(valid, tc.old, tc.replacement, 1)))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q, got %v", tc.want, err)
+			}
+		})
+	}
+}

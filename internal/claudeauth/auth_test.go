@@ -306,3 +306,39 @@ func TestExchangeRequiresMatchingWorkflowSHA(t *testing.T) {
 		})
 	}
 }
+
+func TestFederationTokenMinimumLifetime(t *testing.T) {
+	now := time.Date(2026, 11, 23, 0, 0, 0, 0, time.UTC)
+	cfg := testConfig()
+	cfg.Now = func() time.Time { return now }
+	var exchanges int
+	lifetime := 600
+	client := &http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			return respond(200, fmt.Sprintf(`{"value":%q}`, factoryAssertion("signature")))
+		}
+		exchanges++
+		return respond(200, fmt.Sprintf(`{"access_token":"fake-access-%d","token_type":"Bearer","expires_in":%d}`, exchanges, lifetime))
+	})}
+	f := NewFederation("", client, cfg)
+	for _, tc := range []struct {
+		advance time.Duration
+		want    int
+		count   int
+	}{
+		{0, 600, 1},
+		{5 * time.Minute, 300, 1},
+		{time.Second, 600, 2},
+	} {
+		now = now.Add(tc.advance)
+		token, expires, err := f.Token(t.Context())
+		if err != nil || token != fmt.Sprint("fake-access-", tc.count) || expires != tc.want || exchanges != tc.count {
+			t.Fatalf("unexpected federation token lifetime %d or exchange count %d, error = %v", expires, exchanges, err)
+		}
+	}
+	now = now.Add(10 * time.Minute)
+	lifetime = 299
+	if token, seconds, err := f.Token(t.Context()); err == nil || token != "" || seconds != 0 {
+		t.Fatal("Token accepted a newly exchanged credential with less than five minutes left")
+	}
+}

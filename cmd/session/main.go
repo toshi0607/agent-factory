@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/toshi0607/agent-factory/internal/cfsandbox"
 	"github.com/toshi0607/agent-factory/internal/claude"
 	"github.com/toshi0607/agent-factory/internal/claudeauth"
 	"github.com/toshi0607/agent-factory/internal/delivery"
@@ -42,6 +43,7 @@ func (wallClock) Sleep(ctx context.Context, delay time.Duration) error {
 type runner struct {
 	api          *claude.Client
 	auth         *claudeauth.Federation
+	worker       *cfsandbox.Client
 	clock        clock
 	pollInterval time.Duration
 	stdout       io.Writer
@@ -50,22 +52,25 @@ type runner struct {
 var messagesModelPattern = regexp.MustCompile(`^claude-[a-z0-9-]{1,60}$`)
 
 type state struct {
-	WorkID                   string    `json:"work_id"`
-	Candidate                string    `json:"candidate"`
-	Task                     string    `json:"task"`
-	BaseCommit               string    `json:"base_commit"`
-	FactoryCommit            string    `json:"factory_commit"`
-	Model                    string    `json:"model"`
-	Role                     string    `json:"role"`
-	EnvironmentID            string    `json:"environment_id"`
-	AgentID                  string    `json:"agent_id"`
-	UploadedFileIDs          []string  `json:"uploaded_file_ids"`
-	SessionID                string    `json:"session_id"`
-	BudgetCents              int       `json:"budget_cents"`
-	MinutesLimit             int       `json:"minutes_limit"`
-	StartedAt                time.Time `json:"started_at"`
-	EnvironmentRequestSHA256 string    `json:"environment_request_sha256"`
-	AgentRequestSHA256       string    `json:"agent_request_sha256"`
+	WorkID                   string     `json:"work_id"`
+	Candidate                string     `json:"candidate"`
+	Task                     string     `json:"task"`
+	BaseCommit               string     `json:"base_commit"`
+	FactoryCommit            string     `json:"factory_commit"`
+	Model                    string     `json:"model"`
+	Role                     string     `json:"role"`
+	EnvironmentID            string     `json:"environment_id"`
+	AgentID                  string     `json:"agent_id"`
+	UploadedFileIDs          []string   `json:"uploaded_file_ids"`
+	SessionID                string     `json:"session_id"`
+	BudgetCents              int        `json:"budget_cents"`
+	MinutesLimit             int        `json:"minutes_limit"`
+	StartedAt                time.Time  `json:"started_at"`
+	EnvironmentRequestSHA256 string     `json:"environment_request_sha256"`
+	AgentRequestSHA256       string     `json:"agent_request_sha256"`
+	WorkerVersion            string     `json:"worker_version,omitempty"`
+	WorkerFactoryCommit      string     `json:"worker_factory_commit,omitempty"`
+	WorkerTokenPushedAt      *time.Time `json:"worker_token_pushed_at,omitempty"`
 }
 
 func main() {

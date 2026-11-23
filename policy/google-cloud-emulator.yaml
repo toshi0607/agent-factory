@@ -9,6 +9,13 @@ toolchain:
     url: https://go.dev/dl/go1.26.11.linux-amd64.tar.gz
     sha256: 9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec
     size_bytes: 66999944
+pricing:
+  claude-opus-5-5:
+    input: 400
+    output: 2000
+    cache_write_5m: 500
+    cache_write_1h: 800
+    cache_read: 40
 egress:
   gomod:
     allowed_hosts:

@@ -501,8 +501,15 @@ validate_workflow() {
         if [[ $file == .github/workflows/* && $run_line != 0 ]]; then
           validate_session_invocations "$script" "$run_line"
         fi
-        if [[ $step_number == 1 && $ref_guard == 1 && ${script%$'\n'} == "$factory_ref_guard" ]]; then
-          checked_ref=1
+        if [[ $step_number == 1 && $ref_guard == 1 ]]; then
+          if [[ ${script%$'\n'} == "$factory_ref_guard" ]]; then
+            checked_ref=1
+          elif [[ $script == "$factory_ref_guard"$'\n'* ]]; then
+            case "$file:$name" in
+              .github/workflows/p0-run.yml:start|.github/workflows/p0-run.yml:collect|.github/workflows/p0-recover.yml:recover)
+                checked_ref=1 ;;
+            esac
+          fi
         fi
         if [[ -n $locked ]]; then
           [[ $uses =~ $action_version ]] || fail "use a full version tag for action '$uses' in job $name"

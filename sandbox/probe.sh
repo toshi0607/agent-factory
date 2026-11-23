@@ -5,6 +5,7 @@ set -o pipefail
 
 out="${FACTORY_OUT_DIR:-/mnt/session/outputs}"
 mkdir -p -- "$out" 2>/dev/null || exit 0
+candidate=${FACTORY_CANDIDATE:-managed-agents}
 
 scan_files() {
   local root=$1 label=$2 file
@@ -34,6 +35,78 @@ probe_url() {
     5|6|7|28|35|56|97) return 1 ;;
     *) return 2 ;;
   esac
+}
+
+probe_worker_url() {
+  local url=$1 label=$2 expected=$3 response code deny status=0
+  shift 3
+  response=$(command curl --disable --silent --max-time 15 --output /dev/null \
+    --dump-header - --write-out '%{http_code}\n' "$@" -- "$url") || status=$?
+  code=${response##*$'\n'}
+  if [[ $status != 0 || ! $code =~ ^[1-5][0-9][0-9]$ ]]; then
+    printf '%s -> curl error %s\n' "$label" "$status"
+    case $status in
+      5|6|7|28|35|56|97) return 1 ;;
+      *) return 2 ;;
+    esac
+  fi
+  if [[ $code == 403 ]]; then
+    deny=$(LC_ALL=C awk '
+      /^HTTP\// { deny = ""; next }
+      tolower($0) ~ /^x-factory-denied:/ {
+        sub(/^[^:]*:[ \t]*/, "")
+        sub(/[ \t\r]+$/, "")
+        if ($0 ~ /^(run_not_started|invalid_url|plain_http|userinfo|port_not_allowed|ip_literal|llm_path|host_not_allowed|path_not_allowed|method_not_allowed|body_not_allowed|llm_body_too_large|llm_model)$/)
+          deny = " denied " $0
+        else
+          deny = " denied"
+      }
+      END { printf "%s", deny }
+    ' <<< "${response%$'\n'*}")
+    if [[ -n $deny ]]; then
+      printf '%s -> %s%s\n' "$label" "$code" "$deny"
+      return 1
+    fi
+  fi
+  printf '%s -> %s\n' "$label" "$code"
+  [[ $code == "$expected" || ( $expected == reachable && $code == [23]* ) ]] && return 0
+  return 2
+}
+
+probe_egress() {
+  if [[ $candidate == cloudflare-sandbox ]]; then
+    probe_worker_url "$1" "$1" reachable
+  else
+    probe_url "$1"
+  fi
+}
+
+expect_worker_block() {
+  local status=0
+  probe_worker_url "$@" || status=$?
+  [[ $status == 1 ]]
+}
+
+probe_handler() {
+  local proxy=https://proxy.golang.org/ api=https://api.anthropic.com/v1
+  local count_label='POST https://api.anthropic.com/v1/messages/count_tokens'
+  expect_worker_block http://proxy.golang.org/ http://proxy.golang.org/ reachable || handler_checks=FAIL
+  expect_worker_block https://proxy.golang.org:8443/ https://proxy.golang.org:8443/ reachable || handler_checks=FAIL
+  expect_worker_block https://1.1.1.1/ https://1.1.1.1/ reachable || handler_checks=FAIL
+  expect_worker_block "$proxy" "POST $proxy" reachable --request POST || handler_checks=FAIL
+  expect_worker_block "$api/models" "GET $api/models" reachable || handler_checks=FAIL
+  expect_worker_block "$api/messages" "POST $api/messages (wrong model)" reachable \
+    --header 'content-type: application/json' --header 'anthropic-version: 2023-06-01' \
+    --data '{"model":"wrong-model","max_tokens":1,"messages":[{"role":"user","content":"Hi"}]}' || handler_checks=FAIL
+  if [[ ${ANTHROPIC_API_KEY:-} == provided-by-worker && ${ANTHROPIC_MODEL:-} =~ ^claude-[a-z0-9-]{1,60}$ ]]; then
+    printf 'x-api-key: %s\n' "$ANTHROPIC_API_KEY" |
+      probe_worker_url "$api/messages/count_tokens" "$count_label" 200 --header @- \
+        --header 'content-type: application/json' --header 'anthropic-version: 2023-06-01' \
+        --data "{\"model\":\"$ANTHROPIC_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}" || handler_checks=FAIL
+  else
+    printf '%s -> 000\n' "$count_label"
+    handler_checks=FAIL
+  fi
 }
 
 probe_ssh_directory() (
@@ -223,10 +296,23 @@ probe_token_request() {
   allowlist=${allowlist//$'\n'/ }
   allowlist=${allowlist//$'\t'/ }
   platform_names=${PROBE_PLATFORM_ENV_NAMES-ANTHROPIC_COMMIT_TOKEN ANTHROPIC_COMMIT_SIGN_URL}
+  if [[ $candidate == cloudflare-sandbox ]]; then
+    platform_names='ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'
+  fi
   platform_present=()
   while IFS= read -r name; do
     platform=false
-    if [[ " $platform_names " == *" $name "* ]]; then
+    if [[ $candidate == cloudflare-sandbox && $name == ANTHROPIC_API_KEY ]]; then
+      if [[ ${ANTHROPIC_API_KEY:-} == provided-by-worker ]]; then
+        platform_present+=("$name")
+        printf 'ANTHROPIC_API_KEY -> placeholder\n'
+      else
+        no_credential_env=FAIL
+        printf 'ANTHROPIC_API_KEY -> invalid\n'
+      fi
+      continue
+    fi
+    if [[ " $platform_names " == *" $name "* || ( $candidate == cloudflare-sandbox && $name == CLOUDFLARE_* ) ]]; then
       platform_present+=("$name")
       platform=true
     fi
@@ -263,27 +349,37 @@ probe_token_request() {
   printf '== egress\n'
   allowed_hosts_reachable=PASS
   for url in https://proxy.golang.org/ https://sum.golang.org/latest; do
-    probe_url "$url" || allowed_hosts_reachable=FAIL
+    probe_egress "$url" || allowed_hosts_reachable=FAIL
   done
   other_hosts_blocked=PASS
   for url in https://example.com/ https://github.com/ https://api.github.com/ \
     https://api.anthropic.com/ https://storage.googleapis.com/ https://go.dev/ \
     https://pypi.org/ https://registry.npmjs.org/; do
     status=0
-    probe_url "$url" || status=$?
+    probe_egress "$url" || status=$?
     if [[ $status != 1 ]]; then
       other_hosts_blocked=FAIL
     fi
   done
+
+  if [[ $candidate == cloudflare-sandbox ]]; then
+    printf '== handler checks\n'
+    handler_checks=PASS
+    probe_handler
+  fi
 
   printf '== ssh directory\n'
   probe_ssh_directory
 
   printf '== anthropic api reachability\n'
   for url in https://api.anthropic.com/ https://api.anthropic.com/v1/models https://example.com/; do
-    probe_reachability "$url"
+    if [[ $candidate == cloudflare-sandbox ]]; then
+      probe_egress "$url"
+    else
+      probe_reachability "$url"
+    fi
   done
-  if [[ ${ANTHROPIC_COMMIT_SIGN_URL+x} ]]; then
+  if [[ $candidate != cloudflare-sandbox && ${ANTHROPIC_COMMIT_SIGN_URL+x} ]]; then
     if [[ $ANTHROPIC_COMMIT_SIGN_URL == https://* && $ANTHROPIC_COMMIT_SIGN_URL != *[[:space:][:cntrl:]]* ]]; then
       probe_reachability "$ANTHROPIC_COMMIT_SIGN_URL" 'sign url (GET without the platform token)'
     else
@@ -292,10 +388,14 @@ probe_token_request() {
   fi
 
   printf '== platform token\n'
-  probe_platform_token
+  if [[ $candidate == cloudflare-sandbox ]]; then
+    printf 'skipped\n'
+  else
+    probe_platform_token
+  fi
 
   printf '== platform token against the api\n'
-  if [[ ${ANTHROPIC_COMMIT_TOKEN+x} ]]; then
+  if [[ $candidate != cloudflare-sandbox && ${ANTHROPIC_COMMIT_TOKEN+x} ]]; then
     probe_token_request bearer 'Authorization: Bearer '
     probe_token_request x-api-key 'x-api-key: '
   else
@@ -308,6 +408,9 @@ probe_token_request() {
   printf 'no_credential_files %s\n' "$no_credential_files"
   printf 'allowed_hosts_reachable %s\n' "$allowed_hosts_reachable"
   printf 'other_hosts_blocked %s\n' "$other_hosts_blocked"
+  if [[ $candidate == cloudflare-sandbox ]]; then
+    printf 'handler_checks %s\n' "$handler_checks"
+  fi
   printf '== done\n'
 } > "$out/probe.txt" 2>/dev/null
 exit 0

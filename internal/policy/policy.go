@@ -5,19 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
 )
 
 type Policy struct {
-	Product   Product         `yaml:"product"`
-	Toolchain Toolchain       `yaml:"toolchain"`
-	Egress    map[string]Rule `yaml:"egress"`
-	Roles     map[string]Role `yaml:"roles"`
+	Product   Product           `yaml:"product"`
+	Toolchain Toolchain         `yaml:"toolchain"`
+	Egress    map[string]Rule   `yaml:"egress"`
+	Roles     map[string]Role   `yaml:"roles"`
+	Pricing   map[string]Prices `yaml:"pricing,omitempty"`
 }
 
 type Product struct {
@@ -38,7 +41,21 @@ type Go struct {
 }
 
 type Rule struct {
-	AllowedHosts []string `yaml:"allowed_hosts"`
+	AllowedHosts []string   `yaml:"allowed_hosts"`
+	PathRules    []PathRule `yaml:"path_rules,omitempty"`
+}
+
+type PathRule struct {
+	Host         string   `yaml:"host" json:"host"`
+	PathPrefixes []string `yaml:"path_prefixes,omitempty" json:"path_prefixes,omitempty"`
+}
+
+type Prices struct {
+	Input        float64 `yaml:"input" json:"input"`
+	Output       float64 `yaml:"output" json:"output"`
+	CacheWrite5m float64 `yaml:"cache_write_5m" json:"cache_write_5m"`
+	CacheWrite1h float64 `yaml:"cache_write_1h" json:"cache_write_1h"`
+	CacheRead    float64 `yaml:"cache_read" json:"cache_read"`
 }
 
 type Role struct {
@@ -55,6 +72,8 @@ type Budget struct {
 }
 
 var goArchive = regexp.MustCompile(`^go[A-Za-z0-9.]+\.linux-amd64\.tar\.gz$`)
+var hostname = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+var numericHost = regexp.MustCompile(`^[0-9.]+$`)
 
 func Load(path string) (Policy, error) {
 	f, err := os.Open(path)
@@ -116,13 +135,36 @@ func (p Policy) validate() error {
 	if len(p.Egress) == 0 || len(p.Roles) == 0 {
 		return errors.New("egress and roles are required")
 	}
+	for model, prices := range p.Pricing {
+		if strings.TrimSpace(model) == "" {
+			return errors.New("pricing requires a model name")
+		}
+		for _, price := range []float64{prices.Input, prices.Output, prices.CacheWrite5m, prices.CacheWrite1h, prices.CacheRead} {
+			if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+				return fmt.Errorf("pricing for %q requires positive finite prices", model)
+			}
+		}
+	}
 	for name, rule := range p.Egress {
-		if strings.TrimSpace(name) == "" || len(rule.AllowedHosts) == 0 {
-			return fmt.Errorf("egress %q must have a name and non-empty allowed_hosts", name)
+		if strings.TrimSpace(name) == "" || len(rule.AllowedHosts)+len(rule.PathRules) == 0 {
+			return fmt.Errorf("egress %q must have a name and non-empty allowed_hosts or path_rules", name)
 		}
 		for _, host := range rule.AllowedHosts {
-			if strings.TrimSpace(host) == "" {
-				return fmt.Errorf("egress %q contains an empty allowed host", name)
+			if !validHost(host) {
+				return fmt.Errorf("egress %q contains an invalid lowercase hostname in allowed_hosts", name)
+			}
+		}
+		for _, entry := range rule.PathRules {
+			if !validHost(entry.Host) || len(entry.PathPrefixes) == 0 {
+				return fmt.Errorf("egress %q path_rules require a lowercase hostname and path prefixes", name)
+			}
+			if slices.Contains(rule.AllowedHosts, entry.Host) {
+				return fmt.Errorf("egress %q: host %q appears in both allowed_hosts and path_rules", name, entry.Host)
+			}
+			for _, prefix := range entry.PathPrefixes {
+				if !strings.HasPrefix(prefix, "/") {
+					return fmt.Errorf("egress %q path_rules prefixes must start with /", name)
+				}
 			}
 		}
 	}
@@ -131,14 +173,38 @@ func (p Policy) validate() error {
 			strings.TrimSpace(role.Model) == "" || strings.TrimSpace(role.Prompt) == "" || len(role.Egress) == 0 {
 			return fmt.Errorf("role %q requires a name, agent, model, prompt, and egress", name)
 		}
-		for _, rule := range role.Egress {
-			if _, ok := p.Egress[rule]; !ok {
-				return fmt.Errorf("role %q references unknown egress %q", name, rule)
+		hosts := make(map[string]bool)
+		for _, ruleName := range role.Egress {
+			rule, ok := p.Egress[ruleName]
+			if !ok {
+				return fmt.Errorf("role %q references unknown egress %q", name, ruleName)
+			}
+			for _, host := range rule.AllowedHosts {
+				if err := addHost(hosts, host, false); err != nil {
+					return fmt.Errorf("role %q: %w", name, err)
+				}
+			}
+			for _, entry := range rule.PathRules {
+				if err := addHost(hosts, entry.Host, true); err != nil {
+					return fmt.Errorf("role %q: %w", name, err)
+				}
 			}
 		}
 		if role.Budget.LLMUSDCents <= 0 || role.Budget.Minutes <= 0 {
 			return fmt.Errorf("role %q budget values must be positive", name)
 		}
 	}
+	return nil
+}
+
+func validHost(host string) bool {
+	return len(host) <= 253 && hostname.MatchString(host) && !numericHost.MatchString(host)
+}
+
+func addHost(hosts map[string]bool, host string, restricted bool) error {
+	if previous, ok := hosts[host]; ok && previous != restricted {
+		return fmt.Errorf("host %q appears in both allowed_hosts and path_rules", host)
+	}
+	hosts[host] = restricted
 	return nil
 }

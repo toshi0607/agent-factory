@@ -11,12 +11,40 @@ if [[ -e "$work/product" || -L "$work/product" ]]; then
 fi
 
 shopt -s nullglob
-toolchains=("$delivery"/go*.linux-amd64.tar.gz)
-if (( ${#toolchains[@]} != 1 )); then
-  printf 'Expected exactly one Go toolchain archive\n' >&2
-  exit 1
+archives=("$delivery/product.tar.gz")
+if [[ ${FACTORY_GO_ROOT+x} ]]; then
+  go_bin="$FACTORY_GO_ROOT/bin"
+  if [[ -z "$FACTORY_GO_ROOT" || ! -x "$go_bin/go" || ! -f "$go_bin/go" ]]; then
+    printf 'FACTORY_GO_ROOT must contain an executable bin/go\n' >&2
+    exit 1
+  fi
+  version="$(python3 - "$delivery/manifest.json" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    files = json.load(stream)["files"]
+versions = [match[1] for entry in files if
+            (match := re.fullmatch(r"(go[A-Za-z0-9.]+)\.linux-amd64\.tar\.gz", entry["name"]))]
+if len(versions) != 1:
+    sys.exit("Expected exactly one Go toolchain entry in the manifest")
+print(versions[0])
+PY
+)"
+  if ! installed="$(GOTOOLCHAIN=local "$go_bin/go" version)" || [[ " $installed " != *" $version "* ]]; then
+    printf 'Installed Go version does not match manifest version %s\n' "$version" >&2
+    exit 1
+  fi
+else
+  toolchains=("$delivery"/go*.linux-amd64.tar.gz)
+  if (( ${#toolchains[@]} != 1 )); then
+    printf 'Expected exactly one Go toolchain archive\n' >&2
+    exit 1
+  fi
+  archives+=("${toolchains[0]}")
+  go_bin="$work/toolchain/go/bin"
 fi
-archives=("$delivery/product.tar.gz" "${toolchains[0]}")
 proxy=https://proxy.golang.org
 if [[ -f "$delivery/modproxy.tar.gz" ]]; then
   archives+=("$delivery/modproxy.tar.gz")
@@ -49,17 +77,23 @@ PY
   printf '%s  %s\n' "$hash" "$name" | (cd -- "$delivery" && sha256sum -c -)
 done
 
-mkdir -- "$work/base" "$work/product" "$work/toolchain"
+if [[ ${FACTORY_GO_ROOT+x} ]]; then
+  mkdir -- "$work/base" "$work/product"
+else
+  mkdir -- "$work/base" "$work/product" "$work/toolchain"
+fi
 tar -xzf "${archives[0]}" -C "$work/base"
 tar -xzf "${archives[0]}" -C "$work/product"
 chmod -R a-w "$work/base"
-tar -xzf "${toolchains[0]}" -C "$work/toolchain"
+if [[ ! ${FACTORY_GO_ROOT+x} ]]; then
+  tar -xzf "${toolchains[0]}" -C "$work/toolchain"
+fi
 if [[ -f "$delivery/modproxy.tar.gz" ]]; then
   tar -xzf "$delivery/modproxy.tar.gz" -C "$work"
 fi
 
 {
-  printf 'export PATH=%q:"$PATH"\n' "$work/toolchain/go/bin"
+  printf 'export PATH=%q:"$PATH"\n' "$go_bin"
   printf 'export GOTOOLCHAIN=local\n'
   printf 'export GOCACHE=%q\n' "$work/gocache"
   printf 'export GOMODCACHE=%q\n' "$work/gomodcache"

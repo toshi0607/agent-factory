@@ -438,3 +438,194 @@ func run(t *testing.T, dir string, env []string, name string, args ...string) st
 	}
 	return string(output)
 }
+
+func TestSetupBakedGo(t *testing.T) {
+	if _, err := exec.LookPath("sha256sum"); err != nil {
+		t.Skip("sha256sum is unavailable")
+	}
+	for _, tc := range []struct {
+		name, version, wantError string
+		executable               bool
+		corrupt                  string
+	}{
+		{name: "matching version", version: "go1.26.11", executable: true},
+		{name: "different version", version: "go1.26.110", executable: true, wantError: "does not match manifest version go1.26.11"},
+		{name: "missing executable", wantError: "must contain an executable bin/go"},
+		{name: "corrupt product", version: "go1.26.11", executable: true, corrupt: "product.tar.gz", wantError: "FAILED"},
+		{name: "corrupt proxy", version: "go1.26.11", executable: true, corrupt: "modproxy.tar.gz", wantError: "FAILED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mounted, work, goRoot := filepath.Join(dir, "delivery"), filepath.Join(dir, "work"), filepath.Join(dir, "baked Go")
+			mkdir(t, mounted)
+			mkdir(t, goRoot)
+			mkdir(t, filepath.Join(goRoot, "bin"))
+			write(t, filepath.Join(mounted, "setup.sh"), read(t, "setup.sh"))
+			makeArchive(t, filepath.Join(mounted, "product.tar.gz"), map[string]string{"product.go": "package product\n"})
+			makeArchive(t, filepath.Join(mounted, "modproxy.tar.gz"), map[string]string{"modproxy/list": "v1.0.0\n"})
+			m := delivery.Manifest{Task: "test", BaseCommit: "test-base", Files: []delivery.File{
+				{Name: toolchain, SHA256: strings.Repeat("0", 64), Bytes: 42},
+			}}
+			for _, name := range []string{"product.tar.gz", "modproxy.tar.gz"} {
+				entry, err := delivery.Inspect(filepath.Join(mounted, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				m.Files = append(m.Files, entry)
+			}
+			if err := delivery.WriteAtomic(filepath.Join(mounted, delivery.ManifestName), m.Write); err != nil {
+				t.Fatal(err)
+			}
+			if tc.executable {
+				script := "#!/bin/bash\n[[ $1 == version && $GOTOOLCHAIN == local ]] || exit 1\n" +
+					"printf 'go version " + tc.version + " linux/amd64\\n'\n"
+				if err := os.WriteFile(filepath.Join(goRoot, "bin", "go"), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.corrupt != "" {
+				write(t, filepath.Join(mounted, tc.corrupt), "corrupt archive")
+			}
+			t.Cleanup(func() {
+				if err := os.Chmod(filepath.Join(work, "base"), 0o755); err != nil && !os.IsNotExist(err) {
+					t.Error(err)
+				}
+			})
+			env := append(os.Environ(), "FACTORY_WORK_DIR="+work, "FACTORY_GO_ROOT="+goRoot)
+			if tc.wantError != "" {
+				cmd := exec.CommandContext(t.Context(), "bash", filepath.Join(mounted, "setup.sh"))
+				cmd.Env = env
+				output, err := cmd.CombinedOutput()
+				if err == nil || !strings.Contains(string(output), tc.wantError) {
+					t.Fatalf("setup should fail with %q, got %v\n%s", tc.wantError, err, output)
+				}
+				return
+			}
+			run(t, "", env, "bash", filepath.Join(mounted, "setup.sh"))
+			envFile := filepath.Join(work, "env.sh")
+			got := run(t, "", env, "bash", "-c", `source "$1" && command -v go && go version`, "bash", envFile)
+			if want := filepath.Join(goRoot, "bin", "go") + "\ngo version go1.26.11 linux/amd64\n"; got != want {
+				t.Fatalf("setup did not select baked Go: %q", got)
+			}
+			if _, err := os.Stat(filepath.Join(work, "toolchain")); !os.IsNotExist(err) {
+				t.Fatal("setup used an archive for baked Go")
+			}
+			if data := read(t, filepath.Join(work, "modproxy", "list")); data != "v1.0.0\n" {
+				t.Fatal("setup did not extract the module proxy")
+			}
+		})
+	}
+}
+
+func TestCloudflareProbe(t *testing.T) {
+	dir := t.TempDir()
+	home, bin, out := filepath.Join(dir, "home"), filepath.Join(dir, "bin"), filepath.Join(dir, "out")
+	mkdir(t, home)
+	mkdir(t, bin)
+	curl := `#!/bin/bash
+url=${!#}
+if [[ $url == --version ]]; then
+  printf 'curl test version\n'
+  exit 0
+fi
+method=GET
+body=
+header=
+while (($#)); do
+  case $1 in
+    --request) method=$2; shift ;;
+    --data) body=$2; method=POST; shift ;;
+    --header)
+      if [[ $2 == @- ]]; then
+        IFS= read -r header
+      fi
+      shift ;;
+    --output) [[ $2 == /dev/null ]] || exit 42; shift ;;
+    --dump-header) [[ $2 == - ]] || exit 42; shift ;;
+  esac
+  shift
+done
+code=403
+deny=host_not_allowed
+case "$method $url" in
+  'GET http://proxy.golang.org/') deny=plain_http ;;
+  'GET https://proxy.golang.org:8443/') printf '000\n'; exit 7 ;;
+  'GET https://1.1.1.1/') printf '000\n'; exit 35 ;;
+  'GET https://proxy.golang.org/'|'GET https://sum.golang.org/latest') code=200; deny= ;;
+  'POST https://proxy.golang.org/') deny=method_not_allowed ;;
+  'GET https://api.anthropic.com/v1/models')
+    deny=llm_path
+    [[ $SCENARIO == ordinary-handler-403 ]] && deny=
+    ;;
+  'POST https://api.anthropic.com/v1/messages')
+    [[ $body == *'"model":"wrong-model"'* ]] || exit 42
+    deny=llm_model
+    ;;
+  'POST https://api.anthropic.com/v1/messages/count_tokens')
+    [[ $body == *'"model":"claude-test"'* && $body == *'"role":"user"'* && $header == 'x-api-key: provided-by-worker' ]] || exit 42
+    code=200
+    [[ $SCENARIO == count-201 ]] && code=201
+    deny=
+    ;;
+  'GET https://example.com/')
+    if [[ $SCENARIO == ordinary-egress-403 ]]; then
+      printf 'HTTP/1.1 200 Connection established\r\nx-factory-denied: host_not_allowed\r\n\r\n'
+      deny=
+    fi
+    ;;
+  'GET https://api.anthropic.com/') deny=llm_path ;;
+esac
+printf 'HTTP/1.1 %s\r\nX-Private-Header: fixture-private-header\r\n' "$code"
+[[ -n $deny ]] && printf 'X-Factory-Denied: %s\r\n' "$deny"
+printf '\r\n%s\n' "$code"
+`
+	if err := os.WriteFile(filepath.Join(bin, "curl"), []byte(curl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const invalidKey = "synthetic-key-value-do-not-print"
+	for _, tc := range []struct {
+		scenario, key, keyVerdict, envVerdict, egress, blockedVerdict, count, handlerVerdict string
+	}{
+		{"pass", "provided-by-worker", "placeholder", "PASS", "403 denied host_not_allowed", "PASS", "200", "PASS"},
+		{"bad-key", invalidKey, "invalid", "FAIL", "403 denied host_not_allowed", "PASS", "000", "FAIL"},
+		{"ordinary-egress-403", "provided-by-worker", "placeholder", "PASS", "403", "FAIL", "200", "PASS"},
+		{"ordinary-handler-403", "provided-by-worker", "placeholder", "PASS", "403 denied host_not_allowed", "PASS", "200", "FAIL"},
+		{"count-201", "provided-by-worker", "placeholder", "PASS", "403 denied host_not_allowed", "PASS", "201", "FAIL"},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			env := []string{"PATH=" + bin + ":/usr/bin:/bin", "HOME=" + home, "FACTORY_OUT_DIR=" + out,
+				"FACTORY_CANDIDATE=cloudflare-sandbox", "SCENARIO=" + tc.scenario,
+				"ANTHROPIC_API_KEY=" + tc.key, "ANTHROPIC_MODEL=claude-test", "ANTHROPIC_SMALL_FAST_MODEL=claude-fast",
+				"ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-test", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+				"CLOUDFLARE_TEST=fixture-private-env", "PROBE_ALLOWED_ENV_NAMES=ANTHROPIC_API_KEY"}
+			if stdout := run(t, "", env, "bash", "probe.sh"); stdout != "" {
+				t.Fatal("probe wrote to stdout")
+			}
+			result := read(t, filepath.Join(out, "probe.txt"))
+			for _, forbidden := range []string{invalidKey, "fixture-private-env", "fixture-private-header", "provided-by-worker", "claude-fast"} {
+				if strings.Contains(result, forbidden) {
+					t.Fatal("probe disclosed an environment value or response header")
+				}
+			}
+			for _, want := range []string{
+				"ANTHROPIC_API_KEY -> " + tc.keyVerdict + "\n",
+				"ANTHROPIC_MODEL\n", "ANTHROPIC_SMALL_FAST_MODEL\n", "ANTHROPIC_DEFAULT_HAIKU_MODEL\n",
+				"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\n", "CLOUDFLARE_TEST\n",
+				"https://example.com/ -> " + tc.egress + "\n",
+				"== handler checks\nhttp://proxy.golang.org/ -> 403 denied plain_http\n",
+				"https://proxy.golang.org:8443/ -> curl error 7\n",
+				"https://1.1.1.1/ -> curl error 35\n",
+				"POST https://proxy.golang.org/ -> 403 denied method_not_allowed\n",
+				"POST https://api.anthropic.com/v1/messages (wrong model) -> 403 denied llm_model\n",
+				"POST https://api.anthropic.com/v1/messages/count_tokens -> " + tc.count + "\n",
+				"== platform token\nskipped\n== platform token against the api\nskipped\n",
+				"no_credential_env " + tc.envVerdict + "\n", "allowed_hosts_reachable PASS\n",
+				"other_hosts_blocked " + tc.blockedVerdict + "\n", "handler_checks " + tc.handlerVerdict + "\n",
+			} {
+				if !strings.Contains(result, want) {
+					t.Errorf("missing %q in Cloudflare probe", want)
+				}
+			}
+		})
+	}
+}

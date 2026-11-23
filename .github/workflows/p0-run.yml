@@ -12,6 +12,12 @@ on:
       candidate:
         type: string
         default: managed-agents
+      worker_url:
+        type: string
+        default: ''
+      worker_audience:
+        type: string
+        default: ''
       factory_ref:
         type: string
         required: true
@@ -115,15 +121,34 @@ jobs:
     outputs:
       runner_seconds: ${{ steps.seconds.outputs.runner_seconds }}
     steps:
-      - name: Validate factory ref
+      - name: Validate factory ref and candidate
         shell: bash
         env:
           FACTORY_REF: ${{ inputs.factory_ref }}
+          CANDIDATE: ${{ inputs.candidate }}
+          FACTORY_WORKER_URL: ${{ inputs.worker_url }}
+          FACTORY_WORKER_AUDIENCE: ${{ inputs.worker_audience }}
         run: |
           if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
             printf 'factory_ref must be a full lowercase commit SHA\n' >&2
             exit 1
           fi
+          if [[ $FACTORY_WORKER_URL =~ ^https://([a-zA-Z0-9.-]+)(:[0-9]+)?(/|$) ]]; then
+            printf '::add-mask::%s\n' "${BASH_REMATCH[1]}"
+          fi
+          case "$CANDIDATE" in
+            managed-agents) ;;
+            cloudflare-sandbox)
+              if [[ -z $FACTORY_WORKER_URL || -z $FACTORY_WORKER_AUDIENCE ]]; then
+                printf 'cloudflare-sandbox requires worker_url and worker_audience inputs\n' >&2
+                exit 1
+              fi
+              ;;
+            *)
+              printf 'candidate must be managed-agents or cloudflare-sandbox\n' >&2
+              exit 1
+              ;;
+          esac
       - name: Start timer
         run: printf 'P0_START_TIME=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7.0.1
@@ -154,7 +179,7 @@ jobs:
         with:
           name: p0-files
           path: ${{ runner.temp }}/artifacts/p0-files
-      - name: Start Managed Agents session
+      - name: Start work stage
         id: start
         working-directory: factory
         shell: bash
@@ -164,6 +189,8 @@ jobs:
           BUDGET_CENTS: ${{ inputs.budget_cents }}
           MINUTES: ${{ inputs.minutes }}
           PREPARE_SECONDS: ${{ needs.prepare.outputs.runner_seconds }}
+          FACTORY_WORKER_URL: ${{ inputs.worker_url }}
+          FACTORY_WORKER_AUDIENCE: ${{ inputs.worker_audience }}
           ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation_rule_id }}
           ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
           ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ inputs.service_account_id }}
@@ -198,6 +225,8 @@ jobs:
       - name: Clean up if start fails after creating a session
         if: failure() || cancelled()
         env:
+          FACTORY_WORKER_URL: ${{ inputs.worker_url }}
+          FACTORY_WORKER_AUDIENCE: ${{ inputs.worker_audience }}
           ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation_rule_id }}
           ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
           ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ inputs.service_account_id }}
@@ -218,6 +247,8 @@ jobs:
       id-token: write
       contents: read
     env:
+      FACTORY_WORKER_URL: ${{ inputs.worker_url }}
+      FACTORY_WORKER_AUDIENCE: ${{ inputs.worker_audience }}
       ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation_rule_id }}
       ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
       ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ inputs.service_account_id }}
@@ -231,6 +262,9 @@ jobs:
           if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
             printf 'factory_ref must be a full lowercase commit SHA\n' >&2
             exit 1
+          fi
+          if [[ $FACTORY_WORKER_URL =~ ^https://([a-zA-Z0-9.-]+)(:[0-9]+)?(/|$) ]]; then
+            printf '::add-mask::%s\n' "${BASH_REMATCH[1]}"
           fi
       - uses: actions/checkout@v7.0.1
         with:

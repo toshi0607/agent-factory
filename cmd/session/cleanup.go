@@ -16,6 +16,16 @@ func (r runner) cleanupAfterRun(ctx context.Context, s state, status string, int
 }
 
 func (r runner) cleanup(ctx context.Context, s state, status string, interrupted bool) error {
+	if s.Candidate == workerCandidate {
+		client, err := r.workerClient()
+		if err != nil {
+			return err
+		}
+		if err := client.Delete(ctx, s.WorkID); err != nil {
+			return fmt.Errorf("delete worker run: %w", err)
+		}
+		return nil
+	}
 	var errs []error
 	report := func(resource, id string, err error) {
 		if err != nil && !claude.IsNotFound(err) {

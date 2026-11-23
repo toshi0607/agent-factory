@@ -43,6 +43,35 @@ func (f *Federation) requestOIDC(ctx context.Context, secrets ...string) (string
 	return oidc.Value, nil
 }
 
+// RequestOIDC requests a token for an HTTPS audience client and extracts its expiry.
+func RequestOIDC(ctx context.Context, client *http.Client, cfg Config) (string, time.Time, error) {
+	u, err := url.Parse(cfg.OIDCURL)
+	if err != nil || u.Scheme != "https" {
+		return "", time.Time{}, errors.New("ACTIONS_ID_TOKEN_REQUEST_URL must use HTTPS")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	f := NewFederation("", client, cfg)
+	jwt, err := f.requestOIDC(ctx)
+	if err != nil {
+		return "", time.Time{}, errors.New("GitHub Actions OIDC request failed")
+	}
+	if cfg.ExpectedWorkflowSHA != "" {
+		if err := checkWorkflowSHA(jwt, cfg.ExpectedWorkflowSHA); err != nil {
+			return "", time.Time{}, err
+		}
+	}
+	raw, err := decodeOIDCClaims(jwt)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	var expiration int64
+	if json.Unmarshal(raw["exp"], &expiration) != nil || expiration <= f.now().Unix() {
+		return "", time.Time{}, errors.New("GitHub Actions OIDC JWT has invalid expiration")
+	}
+	return jwt, time.Unix(expiration, 0), nil
+}
+
 // OIDCClaims requests a fresh GitHub OIDC token and decodes its diagnostic claims.
 func (f *Federation) OIDCClaims(ctx context.Context) (map[string]any, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
