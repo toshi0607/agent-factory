@@ -6,6 +6,9 @@ on:
       hold_seconds:
         type: string
         description: Seconds to hold before a second check (blank skips)
+      messages_model:
+        type: string
+        description: Model for one Messages API request (blank skips)
 
 permissions: {}
 
@@ -23,3 +26,4 @@ jobs:
       service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
       workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
       hold_seconds: ${{ inputs.hold_seconds }}
+      messages_model: ${{ inputs.messages_model }}

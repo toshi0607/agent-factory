@@ -76,10 +76,10 @@ func (c *Client) json(ctx context.Context, method, path string, body io.Reader, 
 			return errors.New("invalid Managed Agents JSON response")
 		}
 		return nil
-	})
+	}, nil)
 }
 
-func (c *Client) request(ctx context.Context, method, path, contentType string, body io.Reader, size int64, timeout time.Duration, read func(io.Reader) error) (int, error) {
+func (c *Client) request(ctx context.Context, method, path, contentType string, body io.Reader, size int64, timeout time.Duration, read func(io.Reader) error, messages *MessagesCheck) (int, error) {
 	attempts := 1
 	if method == http.MethodGet || method == http.MethodDelete {
 		attempts = 5
@@ -88,7 +88,7 @@ func (c *Client) request(ctx context.Context, method, path, contentType string, 
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
-		status, retry, retryAfter, err := c.requestOnce(ctx, method, path, contentType, body, size, timeout, read)
+		status, retry, retryAfter, err := c.requestOnce(ctx, method, path, contentType, body, size, timeout, read, messages)
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
@@ -101,7 +101,7 @@ func (c *Client) request(ctx context.Context, method, path, contentType string, 
 	}
 }
 
-func (c *Client) requestOnce(ctx context.Context, method, path, contentType string, body io.Reader, size int64, timeout time.Duration, read func(io.Reader) error) (int, bool, time.Duration, error) {
+func (c *Client) requestOnce(ctx context.Context, method, path, contentType string, body io.Reader, size int64, timeout time.Duration, read func(io.Reader) error, messages *MessagesCheck) (int, bool, time.Duration, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
@@ -117,7 +117,9 @@ func (c *Client) requestOnce(ctx context.Context, method, path, contentType stri
 	}
 	authHeaders := req.Header.Clone()
 	req.Header.Set("anthropic-version", apiVersion)
-	req.Header.Set("anthropic-beta", apiBeta)
+	if messages == nil {
+		req.Header.Set("anthropic-beta", apiBeta)
+	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
@@ -134,6 +136,9 @@ func (c *Client) requestOnce(ctx context.Context, method, path, contentType stri
 	}
 	defer resp.Body.Close()
 	code := resp.StatusCode
+	if messages != nil {
+		return code, false, 0, messages.readResponse(resp, authHeaders)
+	}
 	if code >= 200 && code < 300 {
 		return code, false, 0, read(resp.Body)
 	}

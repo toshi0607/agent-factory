@@ -110,6 +110,154 @@ func TestAuthCheck(t *testing.T) {
 	}
 }
 
+func TestAuthCheckMessages(t *testing.T) {
+	const (
+		model      = "claude-test"
+		access     = "fake-access-placeholder"
+		requestID  = "fake-request-id"
+		content    = "unreported response text"
+		agentsLine = "{\"expires_in\":600,\"scope\":\"workspace:developer\",\"http_status\":200}\n"
+	)
+	for _, tt := range []struct {
+		name      string
+		status    int
+		requestID string
+		body      string
+		wantLine  string
+		wantError string
+	}{
+		{
+			name: "success", status: 200, requestID: requestID,
+			body:     `{"model":"claude-test-echoed","content":[{"text":"` + content + `"}],"usage":{"input_tokens":12,"output_tokens":0}}`,
+			wantLine: `{"messages_http_status":200,"model":"claude-test-echoed","input_tokens":12,"output_tokens":0,"request_id_present":true}`,
+		},
+		{
+			name: "forbidden", status: 403, requestID: requestID,
+			body:      `{"error":{"type":"permission_error","message":"` + access + `"},"content":[{"text":"` + content + `"}]}`,
+			wantLine:  `{"messages_http_status":403,"error_type":"permission_error","request_id_present":true}`,
+			wantError: `{"error":{"type":"permission_error"}}`,
+		},
+		{
+			name: "rate limited without error type", status: 429,
+			body:      `{"error":{"message":"` + content + `"}}`,
+			wantLine:  `{"messages_http_status":429,"request_id_present":false}`,
+			wantError: "HTTP 429",
+		},
+		{
+			name: "unexpected success status", status: 204,
+			wantLine:  `{"messages_http_status":204,"request_id_present":false}`,
+			wantError: "HTTP 204",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			var requests []string
+			client := clientFor(func(req *http.Request) (int, string) {
+				switch req.URL.Path {
+				case "/oidc":
+					payload := base64.RawURLEncoding.EncodeToString([]byte(`{"job_workflow_sha":"` + factoryCommit + `"}`))
+					return 200, fmt.Sprintf(`{"value":%q}`, "fake-header."+payload+".fake-signature")
+				case "/v1/oauth/token":
+					return 200, `{"access_token":"` + access + `","token_type":"Bearer","expires_in":600,"scope":"workspace:developer"}`
+				case "/v1/agents":
+					if req.Header.Get("anthropic-beta") == "" || req.Header.Get("Authorization") != "Bearer "+access {
+						t.Fatal("auth-check sent incorrect Agents headers")
+					}
+					return 200, `{"data":[]}`
+				default:
+					t.Fatal("unexpected request path")
+					return 500, ""
+				}
+			})
+			transport := client.Transport
+			client.Transport = transportFunc(func(req *http.Request) (*http.Response, error) {
+				requests = append(requests, req.Method+" "+req.URL.RequestURI())
+				if req.URL.Path != "/v1/messages" {
+					return transport.RoundTrip(req)
+				}
+				defer req.Body.Close()
+				if stdout.String() != agentsLine {
+					t.Fatal("Messages request must follow the existing auth-check output")
+				}
+				if req.Header.Get("Authorization") != "Bearer "+access || req.Header.Get("anthropic-version") == "" ||
+					req.Header.Get("Content-Type") != "application/json" || len(req.Header.Values("anthropic-beta")) != 0 {
+					t.Fatal("auth-check sent incorrect Messages headers")
+				}
+				var got, want map[string]any
+				decode(t, readRequest(t, req), &got)
+				decode(t, []byte(`{"model":"`+model+`","max_tokens":8,"messages":[{"role":"user","content":"Reply with OK."}]}`), &want)
+				if !reflect.DeepEqual(got, want) {
+					t.Fatal("unexpected Messages request body")
+				}
+				header := make(http.Header)
+				if tt.requestID != "" {
+					header.Set("request-id", tt.requestID)
+				}
+				return &http.Response{StatusCode: tt.status, Header: header, Body: io.NopCloser(strings.NewReader(tt.body))}, nil
+			})
+			const base = "https://api.example.invalid"
+			auth := claudeauth.NewFederation(base, client, claudeauth.Config{
+				OIDCURL: "https://github.example.invalid/oidc", OIDCRequestToken: "fake-oidc-placeholder",
+				FederationRuleID: "rule", OrganizationID: "org", ExpectedWorkflowSHA: factoryCommit,
+			})
+			r := runner{api: claude.New(base, client, auth), auth: auth, stdout: &stdout}
+			err := r.run(t.Context(), []string{"auth-check", "-messages", model})
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatal("expected a successful auth-check")
+				}
+			} else {
+				apiErr, ok := errors.AsType[*claude.HTTPError](err)
+				if !ok || apiErr.StatusCode != tt.status || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatal("expected an HTTP error with the Messages status and sanitized diagnostic")
+				}
+				for _, value := range []string{access, requestID, content} {
+					if strings.Contains(err.Error(), value) || strings.Contains(apiErr.Body, value) {
+						t.Fatal("Messages error included private response data")
+					}
+				}
+			}
+			wantRequests := []string{
+				"GET /oidc?audience=https%3A%2F%2Fapi.anthropic.com",
+				"POST /v1/oauth/token",
+				"GET /v1/agents?limit=1",
+				"POST /v1/messages",
+			}
+			if !slices.Equal(requests, wantRequests) {
+				t.Fatal("unexpected auth-check request sequence")
+			}
+			if stdout.String() != agentsLine+tt.wantLine+"\n" {
+				t.Fatal("auth-check output does not contain exactly the expected metadata")
+			}
+		})
+	}
+}
+
+func TestAuthCheckRejectsInvalidMessagesFlags(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		args      []string
+		wantError string
+	}{
+		{"empty", []string{"-messages", ""}, "-messages model must match"},
+		{"invalid model", []string{"-messages", "claude-test;other"}, "-messages model must match"},
+		{"model too long", []string{"-messages", "claude-" + strings.Repeat("a", 61)}, "-messages model must match"},
+		{"hold", []string{"-messages", "claude-test", "-hold", "1s"}, "-messages and -hold cannot be combined"},
+		{"explicit zero hold", []string{"-messages", "claude-test", "-hold", "0"}, "-messages and -hold cannot be combined"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := testRunner(func(*http.Request) (int, string) {
+				t.Fatal("auth-check sent an HTTP request for invalid flags")
+				return 500, ""
+			}, testClock())
+			err := r.run(t.Context(), append([]string{"auth-check"}, tt.args...))
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatal("expected a Messages flag validation error")
+			}
+		})
+	}
+}
+
 func TestAuthCheckHold(t *testing.T) {
 	for _, tt := range []struct {
 		name, hold, wantError     string

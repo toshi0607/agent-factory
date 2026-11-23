@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strings"
 )
 
 type resourceID struct {
@@ -114,6 +115,70 @@ func (c *Client) CheckAgents(ctx context.Context) (int, error) {
 	return c.json(ctx, http.MethodGet, "/v1/agents?limit=1", nil, nil)
 }
 
+type MessagesCheck struct {
+	HTTPStatus       int    `json:"messages_http_status"`
+	Model            string `json:"model,omitempty"`
+	InputTokens      *int   `json:"input_tokens,omitempty"`
+	OutputTokens     *int   `json:"output_tokens,omitempty"`
+	ErrorType        string `json:"error_type,omitempty"`
+	RequestIDPresent bool   `json:"request_id_present"`
+}
+
+func (c *Client) CheckMessages(ctx context.Context, model string) (MessagesCheck, error) {
+	type message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	body, err := jsonBody(struct {
+		Model     string    `json:"model"`
+		MaxTokens int       `json:"max_tokens"`
+		Messages  []message `json:"messages"`
+	}{model, 8, []message{{"user", "Reply with OK."}}})
+	var check MessagesCheck
+	if err != nil {
+		return check, err
+	}
+	_, err = c.request(ctx, http.MethodPost, "/v1/messages", "application/json", body, -1, requestTimeout, nil, &check)
+	return check, err
+}
+
+func (check *MessagesCheck) readResponse(resp *http.Response, authHeaders http.Header) error {
+	check.HTTPStatus = resp.StatusCode
+	check.RequestIDPresent = resp.Header.Get("request-id") != ""
+	if resp.StatusCode != http.StatusOK {
+		var diagnostic struct {
+			Error struct {
+				Type string `json:"type"`
+			} `json:"error"`
+		}
+		apiErr := &HTTPError{StatusCode: resp.StatusCode}
+		if json.NewDecoder(resp.Body).Decode(&diagnostic) == nil {
+			errorType := errorBody(strings.NewReader(diagnostic.Error.Type), authHeaders)
+			if errorType != "" && !credentialPattern.MatchString(errorType) {
+				check.ErrorType = errorType
+				diagnostic.Error.Type = errorType
+				body, _ := json.Marshal(diagnostic)
+				apiErr.Body = string(body)
+			}
+		}
+		return apiErr
+	}
+	var result struct {
+		Model string `json:"model"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return errors.New("invalid Messages API JSON response")
+	}
+	check.Model = result.Model
+	check.InputTokens = new(result.Usage.InputTokens)
+	check.OutputTokens = new(result.Usage.OutputTokens)
+	return nil
+}
+
 func (c *Client) ArchiveAgent(ctx context.Context, id string) error {
 	_, err := c.json(ctx, http.MethodPost, "/v1/agents/"+url.PathEscape(id)+"/archive", nil, nil)
 	return err
@@ -171,7 +236,7 @@ func (c *Client) UploadFile(ctx context.Context, name string, content io.Reader)
 				return errors.New("invalid Managed Agents file upload response")
 			}
 			return nil
-		})
+		}, nil)
 	if err == nil && result.ID == "" {
 		err = errors.New("Managed Agents upload response is missing a file ID")
 	}
@@ -193,7 +258,7 @@ func (c *Client) DownloadFile(ctx context.Context, id string, w io.Writer) error
 		func(r io.Reader) error {
 			_, err := io.Copy(w, r)
 			return err
-		})
+		}, nil)
 	return err
 }
 

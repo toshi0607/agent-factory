@@ -21,6 +21,9 @@ on:
       hold_seconds:
         type: string
         default: ''
+      messages_model:
+        type: string
+        default: ''
 
 permissions: {}
 
@@ -72,7 +75,19 @@ jobs:
           ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ inputs.service_account_id }}
           ANTHROPIC_WORKSPACE_ID: ${{ inputs.workspace_id }}
           HOLD_SECONDS: ${{ inputs.hold_seconds }}
+          MESSAGES_MODEL: ${{ inputs.messages_model }}
         run: |
+          if [[ -n "$MESSAGES_MODEL" ]]; then
+            if [[ -n "$HOLD_SECONDS" ]]; then
+              printf 'messages_model and hold_seconds cannot be combined\n' >&2
+              exit 1
+            fi
+            if [[ ! "$MESSAGES_MODEL" =~ ^claude-[a-z0-9-]{1,60}$ ]]; then
+              printf 'messages_model must match ^claude-[a-z0-9-]{1,60}$\n' >&2
+              exit 1
+            fi
+            exec "$RUNNER_TEMP/session" auth-check -messages "$MESSAGES_MODEL"
+          fi
           if [[ -z "$HOLD_SECONDS" ]]; then
             exec "$RUNNER_TEMP/session" auth-check
           fi

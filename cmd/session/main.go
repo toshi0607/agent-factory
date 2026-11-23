@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"syscall"
 	"time"
 
@@ -45,6 +46,8 @@ type runner struct {
 	pollInterval time.Duration
 	stdout       io.Writer
 }
+
+var messagesModelPattern = regexp.MustCompile(`^claude-[a-z0-9-]{1,60}$`)
 
 type state struct {
 	WorkID                   string    `json:"work_id"`
@@ -88,13 +91,34 @@ func (r runner) run(ctx context.Context, args []string) error {
 	switch command {
 	case "auth-check":
 		hold := flags.Duration("hold", 0, "wait before checking token refresh (maximum 20 minutes)")
+		model := flags.String("messages", "", "model for one Messages API request")
 		if err := parseFlags(flags, args); err != nil {
 			return err
 		}
 		if *hold < 0 || *hold > 20*time.Minute {
 			return errors.New("-hold must be between 0 and 20 minutes")
 		}
-		return r.authCheck(ctx, *hold)
+		var holdSet, messagesSet bool
+		flags.Visit(func(f *flag.Flag) {
+			holdSet = holdSet || f.Name == "hold"
+			messagesSet = messagesSet || f.Name == "messages"
+		})
+		if messagesSet {
+			if holdSet {
+				return errors.New("-messages and -hold cannot be combined")
+			}
+			if !messagesModelPattern.MatchString(*model) {
+				return errors.New("-messages model must match " + messagesModelPattern.String())
+			}
+		}
+		if err := r.authCheck(ctx, *hold); err != nil || !messagesSet {
+			return err
+		}
+		check, err := r.api.CheckMessages(ctx, *model)
+		if check.HTTPStatus == 0 {
+			return err
+		}
+		return errors.Join(err, json.NewEncoder(r.stdout).Encode(check))
 	case "oidc-claims":
 		if err := parseFlags(flags, args); err != nil {
 			return err
