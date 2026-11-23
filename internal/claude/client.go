@@ -56,14 +56,22 @@ var credentialPattern = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{20,}|sk-ant-`)
 
 func (e *HTTPError) Error() string {
 	status := fmt.Sprintf("Managed Agents API: HTTP %d", e.StatusCode)
-	body := strings.Join(strings.FieldsFunc(e.Body, func(r rune) bool {
+	if body := diagnosticText(e.Body); body != "" {
+		return status + ": " + body
+	}
+	return status
+}
+
+// diagnosticText collapses whitespace, drops credential-like text, and caps the length.
+func diagnosticText(text string) string {
+	text = strings.Join(strings.FieldsFunc(text, func(r rune) bool {
 		return unicode.IsSpace(r) || unicode.IsControl(r)
 	}), " ")
-	if body == "" || credentialPattern.MatchString(body) {
-		return status
+	if credentialPattern.MatchString(text) {
+		return ""
 	}
-	runes := []rune(body)
-	return status + ": " + string(runes[:min(len(runes), 300)])
+	runes := []rune(text)
+	return string(runes[:min(len(runes), 300)])
 }
 
 func (c *Client) json(ctx context.Context, method, path string, body io.Reader, result any) (int, error) {
@@ -119,6 +127,10 @@ func (c *Client) requestOnce(ctx context.Context, method, path, contentType stri
 	req.Header.Set("anthropic-version", apiVersion)
 	if messages == nil {
 		req.Header.Set("anthropic-beta", apiBeta)
+	} else if messages.stream != nil {
+		req.Header.Set("anthropic-version", messagesStreamVersion)
+		req.Header.Set("anthropic-beta", messagesStreamBeta)
+		req.Header.Set("Accept", "application/json")
 	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)

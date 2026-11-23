@@ -24,6 +24,9 @@ on:
       messages_model:
         type: string
         default: ''
+      messages_stream:
+        type: string
+        default: ''
 
 permissions: {}
 
@@ -76,7 +79,12 @@ jobs:
           ANTHROPIC_WORKSPACE_ID: ${{ inputs.workspace_id }}
           HOLD_SECONDS: ${{ inputs.hold_seconds }}
           MESSAGES_MODEL: ${{ inputs.messages_model }}
+          MESSAGES_STREAM: ${{ inputs.messages_stream }}
         run: |
+          if [[ -n "$MESSAGES_STREAM" && "$MESSAGES_STREAM" != true ]]; then
+            printf 'messages_stream must be empty or true\n' >&2
+            exit 1
+          fi
           if [[ -n "$MESSAGES_MODEL" ]]; then
             if [[ -n "$HOLD_SECONDS" ]]; then
               printf 'messages_model and hold_seconds cannot be combined\n' >&2
@@ -85,6 +93,10 @@ jobs:
             if [[ ! "$MESSAGES_MODEL" =~ ^claude-[a-z0-9-]{1,60}$ ]]; then
               printf 'messages_model must match ^claude-[a-z0-9-]{1,60}$\n' >&2
               exit 1
+            fi
+            if [[ "$MESSAGES_STREAM" == true ]]; then
+              mkdir -p "$RUNNER_TEMP/messages-stream"
+              exec "$RUNNER_TEMP/session" auth-check -messages "$MESSAGES_MODEL" -stream-out "$RUNNER_TEMP/messages-stream/response.sse"
             fi
             exec "$RUNNER_TEMP/session" auth-check -messages "$MESSAGES_MODEL"
           fi
@@ -96,3 +108,9 @@ jobs:
             exit 1
           fi
           exec "$RUNNER_TEMP/session" auth-check -hold "${HOLD_SECONDS}s"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: p0-messages-stream
+          path: ${{ runner.temp }}/messages-stream/response.sse
+          if-no-files-found: ignore

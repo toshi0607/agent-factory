@@ -14,6 +14,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 )
 
 type resourceID struct {
@@ -120,9 +121,21 @@ type MessagesCheck struct {
 	Model            string `json:"model,omitempty"`
 	InputTokens      *int   `json:"input_tokens,omitempty"`
 	OutputTokens     *int   `json:"output_tokens,omitempty"`
+	ContentType      string `json:"content_type,omitempty"`
+	StreamBytes      *int64 `json:"stream_bytes,omitempty"`
 	ErrorType        string `json:"error_type,omitempty"`
+	ErrorMessage     string `json:"error_message,omitempty"`
 	RequestIDPresent bool   `json:"request_id_present"`
+
+	stream io.Writer
 }
+
+const (
+	messagesStreamVersion = "2023-06-01"
+	messagesStreamBeta    = "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,effort-2025-11-24"
+	messagesStreamTimeout = 120 * time.Second
+	MessagesStreamLimit   = 4 << 20
+)
 
 func (c *Client) CheckMessages(ctx context.Context, model string) (MessagesCheck, error) {
 	type message struct {
@@ -142,17 +155,85 @@ func (c *Client) CheckMessages(ctx context.Context, model string) (MessagesCheck
 	return check, err
 }
 
+// CheckMessagesStream sends one streaming request shaped like Claude Code's
+// and copies the raw response body to w without reporting its content.
+func (c *Client) CheckMessagesStream(ctx context.Context, model string, w io.Writer) (MessagesCheck, error) {
+	type typed struct {
+		Type string `json:"type"`
+	}
+	type text struct {
+		Type         string `json:"type"`
+		Text         string `json:"text"`
+		CacheControl *typed `json:"cache_control,omitempty"`
+	}
+	type schema struct {
+		Type       string           `json:"type"`
+		Properties map[string]typed `json:"properties"`
+		Required   []string         `json:"required"`
+	}
+	type tool struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		InputSchema schema `json:"input_schema"`
+	}
+	type message struct {
+		Role    string `json:"role"`
+		Content []text `json:"content"`
+	}
+	type metadata struct {
+		UserID string `json:"user_id"`
+	}
+	type outputConfig struct {
+		Effort string `json:"effort"`
+	}
+	type edit struct {
+		Type string `json:"type"`
+		Keep string `json:"keep"`
+	}
+	type contextManagement struct {
+		Edits []edit `json:"edits"`
+	}
+	body, err := jsonBody(struct {
+		Model             string            `json:"model"`
+		MaxTokens         int               `json:"max_tokens"`
+		Stream            bool              `json:"stream"`
+		System            []text            `json:"system"`
+		Messages          []message         `json:"messages"`
+		Tools             []tool            `json:"tools"`
+		Metadata          metadata          `json:"metadata"`
+		Thinking          typed             `json:"thinking"`
+		OutputConfig      outputConfig      `json:"output_config"`
+		ContextManagement contextManagement `json:"context_management"`
+	}{
+		model, 1024, true,
+		[]text{{"text", "You are a test fixture. Reply with the single word OK.", &typed{"ephemeral"}}},
+		[]message{{"user", []text{{"text", "Reply with OK.", nil}}}},
+		[]tool{{"Read", "Read a file.", schema{"object", map[string]typed{"path": {"string"}}, []string{"path"}}}},
+		metadata{"factory-auth-check"}, typed{"adaptive"}, outputConfig{"medium"},
+		contextManagement{[]edit{{"clear_thinking_20251015", "all"}}},
+	})
+	check := MessagesCheck{stream: w}
+	if err != nil {
+		return check, err
+	}
+	_, err = c.request(ctx, http.MethodPost, "/v1/messages?beta=true", "application/json", body, -1, messagesStreamTimeout, nil, &check)
+	return check, err
+}
+
 func (check *MessagesCheck) readResponse(resp *http.Response, authHeaders http.Header) error {
 	check.HTTPStatus = resp.StatusCode
 	check.RequestIDPresent = resp.Header.Get("request-id") != ""
 	if resp.StatusCode != http.StatusOK {
 		var diagnostic struct {
 			Error struct {
-				Type string `json:"type"`
+				Type    string `json:"type"`
+				Message string `json:"message,omitempty"`
 			} `json:"error"`
 		}
 		apiErr := &HTTPError{StatusCode: resp.StatusCode}
 		if json.NewDecoder(resp.Body).Decode(&diagnostic) == nil {
+			check.ErrorMessage = diagnosticText(errorBody(strings.NewReader(diagnostic.Error.Message), authHeaders))
+			diagnostic.Error.Message = ""
 			errorType := errorBody(strings.NewReader(diagnostic.Error.Type), authHeaders)
 			if errorType != "" && !credentialPattern.MatchString(errorType) {
 				check.ErrorType = errorType
@@ -162,6 +243,18 @@ func (check *MessagesCheck) readResponse(resp *http.Response, authHeaders http.H
 			}
 		}
 		return apiErr
+	}
+	if check.stream != nil {
+		check.ContentType = diagnosticText(resp.Header.Get("Content-Type"))
+		n, err := io.Copy(check.stream, io.LimitReader(resp.Body, MessagesStreamLimit))
+		check.StreamBytes = new(n)
+		if err != nil {
+			return errors.New("could not copy the Messages stream")
+		}
+		if extra, _ := io.ReadFull(resp.Body, make([]byte, 1)); extra > 0 {
+			return fmt.Errorf("Messages stream exceeds %d bytes", MessagesStreamLimit)
+		}
+		return nil
 	}
 	var result struct {
 		Model string `json:"model"`

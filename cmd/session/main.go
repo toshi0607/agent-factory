@@ -97,17 +97,27 @@ func (r runner) run(ctx context.Context, args []string) error {
 	case "auth-check":
 		hold := flags.Duration("hold", 0, "wait before checking token refresh (maximum 20 minutes)")
 		model := flags.String("messages", "", "model for one Messages API request")
+		streamOut := flags.String("stream-out", "", "new file for the raw streamed Messages response (requires -messages)")
 		if err := parseFlags(flags, args); err != nil {
 			return err
 		}
 		if *hold < 0 || *hold > 20*time.Minute {
 			return errors.New("-hold must be between 0 and 20 minutes")
 		}
-		var holdSet, messagesSet bool
+		var holdSet, messagesSet, streamSet bool
 		flags.Visit(func(f *flag.Flag) {
 			holdSet = holdSet || f.Name == "hold"
 			messagesSet = messagesSet || f.Name == "messages"
+			streamSet = streamSet || f.Name == "stream-out"
 		})
+		if streamSet {
+			if !messagesSet {
+				return errors.New("-stream-out requires -messages")
+			}
+			if *streamOut == "" {
+				return errors.New("-stream-out must name a file")
+			}
+		}
 		if messagesSet {
 			if holdSet {
 				return errors.New("-messages and -hold cannot be combined")
@@ -116,14 +126,25 @@ func (r runner) run(ctx context.Context, args []string) error {
 				return errors.New("-messages model must match " + messagesModelPattern.String())
 			}
 		}
-		if err := r.authCheck(ctx, *hold); err != nil || !messagesSet {
-			return err
+		if !streamSet {
+			if err := r.authCheck(ctx, *hold); err != nil || !messagesSet {
+				return err
+			}
+			check, err := r.api.CheckMessages(ctx, *model)
+			return r.printMessagesCheck(check, err)
 		}
-		check, err := r.api.CheckMessages(ctx, *model)
-		if check.HTTPStatus == 0 {
-			return err
+		out, err := os.OpenFile(*streamOut, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return fmt.Errorf("create -stream-out file: %w", err)
 		}
-		return errors.Join(err, json.NewEncoder(r.stdout).Encode(check))
+		check, err := claude.MessagesCheck{}, r.authCheck(ctx, *hold)
+		if err == nil {
+			check, err = r.api.CheckMessagesStream(ctx, *model, out)
+		}
+		if closeErr := out.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close -stream-out file: %w", closeErr))
+		}
+		return r.printMessagesCheck(check, err)
 	case "oidc-claims":
 		if err := parseFlags(flags, args); err != nil {
 			return err
@@ -227,6 +248,13 @@ func (r runner) authCheck(ctx context.Context, hold time.Duration) error {
 		err = errors.Join(err, fmt.Errorf("second auth check returned HTTP status %d, want 200", status))
 	}
 	return err
+}
+
+func (r runner) printMessagesCheck(check claude.MessagesCheck, err error) error {
+	if check.HTTPStatus == 0 {
+		return err
+	}
+	return errors.Join(err, json.NewEncoder(r.stdout).Encode(check))
 }
 
 func (r runner) authCheckOnce(ctx context.Context, includeExchanges bool) (int, int, error) {

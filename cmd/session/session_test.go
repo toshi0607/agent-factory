@@ -134,13 +134,13 @@ func TestAuthCheckMessages(t *testing.T) {
 		{
 			name: "forbidden", status: 403, requestID: requestID,
 			body:      `{"error":{"type":"permission_error","message":"` + access + `"},"content":[{"text":"` + content + `"}]}`,
-			wantLine:  `{"messages_http_status":403,"error_type":"permission_error","request_id_present":true}`,
+			wantLine:  `{"messages_http_status":403,"error_type":"permission_error","error_message":"[redacted]","request_id_present":true}`,
 			wantError: `{"error":{"type":"permission_error"}}`,
 		},
 		{
 			name: "rate limited without error type", status: 429,
-			body:      `{"error":{"message":"` + content + `"}}`,
-			wantLine:  `{"messages_http_status":429,"request_id_present":false}`,
+			body:      `{"error":{"message":"rate\n limited"},"content":[{"text":"` + content + `"}]}`,
+			wantLine:  `{"messages_http_status":429,"error_message":"rate limited","request_id_present":false}`,
 			wantError: "HTTP 429",
 		},
 		{
@@ -233,6 +233,145 @@ func TestAuthCheckMessages(t *testing.T) {
 	}
 }
 
+func TestAuthCheckMessagesStream(t *testing.T) {
+	const (
+		model      = "claude-test"
+		access     = "fake-access-placeholder"
+		content    = "unreported stream text"
+		agentsLine = "{\"expires_in\":600,\"scope\":\"workspace:developer\",\"http_status\":200}\n"
+		wantBody   = `{"model":"` + model + `","max_tokens":1024,"stream":true,"system":[{"type":"text","text":"You are a test fixture. Reply with the single word OK.","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply with OK."}]}],"tools":[{"name":"Read","description":"Read a file.","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}],"metadata":{"user_id":"factory-auth-check"},"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"},"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}}`
+		beta       = "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,per-turn-control-2026-07-01,effort-2025-11-24"
+	)
+	stream := "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_delta\ndata: {\"text\":\"" + content + "\"}\n\n"
+	oversized := strings.Repeat("x", claude.MessagesStreamLimit+1)
+	for _, tt := range []struct {
+		name      string
+		status    int
+		body      string
+		existing  bool
+		wantFile  string
+		wantLine  string
+		wantError string
+		wantHTTP  bool
+	}{
+		{
+			name: "success", status: 200, body: stream, wantFile: stream,
+			wantLine: fmt.Sprintf(`{"messages_http_status":200,"content_type":"text/event-stream; charset=utf-8","stream_bytes":%d,"request_id_present":true}`, len(stream)),
+		},
+		{
+			name: "error", status: 401, body: `{"type":"error","error":{"type":"authentication_error","message":"invalid token ` + access + `"}}`,
+			wantLine:  `{"messages_http_status":401,"error_type":"authentication_error","error_message":"invalid token [redacted]","request_id_present":true}`,
+			wantError: `{"error":{"type":"authentication_error"}}`, wantHTTP: true,
+		},
+		{
+			name: "cap exceeded", status: 200, body: oversized, wantFile: oversized[:claude.MessagesStreamLimit],
+			wantLine:  fmt.Sprintf(`{"messages_http_status":200,"content_type":"text/event-stream; charset=utf-8","stream_bytes":%d,"request_id_present":true}`, claude.MessagesStreamLimit),
+			wantError: "Messages stream exceeds",
+		},
+		{name: "existing file", existing: true, wantFile: "keep", wantError: "create -stream-out file"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "response.sse")
+			if tt.existing {
+				write(t, path, "keep")
+			}
+			var stdout bytes.Buffer
+			var requests []string
+			client := clientFor(func(req *http.Request) (int, string) {
+				switch req.URL.Path {
+				case "/oidc":
+					payload := base64.RawURLEncoding.EncodeToString([]byte(`{"job_workflow_sha":"` + factoryCommit + `"}`))
+					return 200, fmt.Sprintf(`{"value":%q}`, "fake-header."+payload+".fake-signature")
+				case "/v1/oauth/token":
+					return 200, `{"access_token":"` + access + `","token_type":"Bearer","expires_in":600,"scope":"workspace:developer"}`
+				case "/v1/agents":
+					return 200, `{"data":[]}`
+				default:
+					t.Fatal("unexpected request path")
+					return 500, ""
+				}
+			})
+			transport := client.Transport
+			client.Transport = transportFunc(func(req *http.Request) (*http.Response, error) {
+				requests = append(requests, req.Method+" "+req.URL.RequestURI())
+				if req.URL.Path != "/v1/messages" {
+					return transport.RoundTrip(req)
+				}
+				defer req.Body.Close()
+				if stdout.String() != agentsLine {
+					t.Fatal("Messages request must follow the existing auth-check output")
+				}
+				if req.Header.Get("Authorization") != "Bearer "+access || req.Header.Get("anthropic-version") != "2023-06-01" ||
+					!slices.Equal(req.Header.Values("anthropic-beta"), []string{beta}) ||
+					req.Header.Get("Content-Type") != "application/json" || req.Header.Get("Accept") != "application/json" {
+					t.Fatal("auth-check sent incorrect streaming Messages headers")
+				}
+				if deadline, ok := req.Context().Deadline(); !ok || time.Until(deadline) <= 60*time.Second {
+					t.Fatal("streaming Messages request must use the long timeout")
+				}
+				var got, want map[string]any
+				decode(t, readRequest(t, req), &got)
+				decode(t, []byte(wantBody), &want)
+				if !reflect.DeepEqual(got, want) {
+					t.Fatal("unexpected streaming Messages request body")
+				}
+				header := make(http.Header)
+				header.Set("request-id", "fake-request-id")
+				header.Set("Content-Type", "text/event-stream; charset=utf-8")
+				return &http.Response{StatusCode: tt.status, Header: header, Body: io.NopCloser(strings.NewReader(tt.body))}, nil
+			})
+			const base = "https://api.example.invalid"
+			auth := claudeauth.NewFederation(base, client, claudeauth.Config{
+				OIDCURL: "https://github.example.invalid/oidc", OIDCRequestToken: "fake-oidc-placeholder",
+				FederationRuleID: "rule", OrganizationID: "org", ExpectedWorkflowSHA: factoryCommit,
+			})
+			r := runner{api: claude.New(base, client, auth), auth: auth, stdout: &stdout}
+			err := r.run(t.Context(), []string{"auth-check", "-messages", model, "-stream-out", path})
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatal("expected a successful streaming auth-check")
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatal("expected a streaming auth-check error")
+			}
+			if tt.wantHTTP {
+				apiErr, ok := errors.AsType[*claude.HTTPError](err)
+				if !ok || apiErr.StatusCode != tt.status || strings.Contains(err.Error(), access) || strings.Contains(apiErr.Body, "invalid token") {
+					t.Fatal("expected an HTTP error with only the sanitized error type")
+				}
+			}
+			if strings.Contains(stdout.String(), content) || strings.Contains(stdout.String(), access) {
+				t.Fatal("streaming auth-check printed private response data")
+			}
+			if read(t, path) != tt.wantFile {
+				t.Fatal("stream file does not hold the expected response body")
+			}
+			if !tt.existing {
+				info, statErr := os.Stat(path)
+				if statErr != nil || info.Mode().Perm() != 0o600 {
+					t.Fatal("stream file must be created with mode 0600")
+				}
+			}
+			wantRequests := []string{
+				"GET /oidc?audience=https%3A%2F%2Fapi.anthropic.com",
+				"POST /v1/oauth/token",
+				"GET /v1/agents?limit=1",
+				"POST /v1/messages?beta=true",
+			}
+			wantStdout := agentsLine + tt.wantLine + "\n"
+			if tt.existing {
+				wantRequests, wantStdout = nil, ""
+			}
+			if !slices.Equal(requests, wantRequests) {
+				t.Fatal("unexpected streaming auth-check request sequence")
+			}
+			if stdout.String() != wantStdout {
+				t.Fatal("streaming auth-check output does not contain exactly the expected metadata")
+			}
+		})
+	}
+}
+
 func TestAuthCheckRejectsInvalidMessagesFlags(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
@@ -244,6 +383,10 @@ func TestAuthCheckRejectsInvalidMessagesFlags(t *testing.T) {
 		{"model too long", []string{"-messages", "claude-" + strings.Repeat("a", 61)}, "-messages model must match"},
 		{"hold", []string{"-messages", "claude-test", "-hold", "1s"}, "-messages and -hold cannot be combined"},
 		{"explicit zero hold", []string{"-messages", "claude-test", "-hold", "0"}, "-messages and -hold cannot be combined"},
+		{"stream without messages", []string{"-stream-out", "out.sse"}, "-stream-out requires -messages"},
+		{"stream with hold", []string{"-stream-out", "out.sse", "-hold", "1s"}, "-stream-out requires -messages"},
+		{"stream with messages and hold", []string{"-messages", "claude-test", "-stream-out", "out.sse", "-hold", "1s"}, "-messages and -hold cannot be combined"},
+		{"empty stream file", []string{"-messages", "claude-test", "-stream-out", ""}, "-stream-out must name a file"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			r := testRunner(func(*http.Request) (int, string) {

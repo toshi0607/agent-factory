@@ -9,6 +9,9 @@ on:
       messages_model:
         type: string
         description: Model for one Messages API request (blank skips)
+      messages_stream:
+        type: string
+        description: Set to true to save the streamed Messages response as an artifact (requires messages_model)
 
 permissions: {}
 
@@ -27,3 +30,4 @@ jobs:
       workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
       hold_seconds: ${{ inputs.hold_seconds }}
       messages_model: ${{ inputs.messages_model }}
+      messages_stream: ${{ inputs.messages_stream }}
