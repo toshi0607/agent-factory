@@ -87,10 +87,14 @@ func (r runner) run(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	switch command {
 	case "auth-check":
+		hold := flags.Duration("hold", 0, "wait before checking token refresh (maximum 20 minutes)")
 		if err := parseFlags(flags, args); err != nil {
 			return err
 		}
-		return r.authCheck(ctx)
+		if *hold < 0 || *hold > 20*time.Minute {
+			return errors.New("-hold must be between 0 and 20 minutes")
+		}
+		return r.authCheck(ctx, *hold)
 	case "oidc-claims":
 		if err := parseFlags(flags, args); err != nil {
 			return err
@@ -175,17 +179,40 @@ func parseFlags(f *flag.FlagSet, args []string, required ...*string) error {
 	return nil
 }
 
-func (r runner) authCheck(ctx context.Context) error {
+func (r runner) authCheck(ctx context.Context, hold time.Duration) error {
+	_, firstExchanges, firstErr := r.authCheckOnce(ctx, hold > 0)
+	if hold == 0 {
+		return firstErr
+	}
+	if err := r.clock.Sleep(ctx, hold); err != nil {
+		return errors.Join(firstErr, fmt.Errorf("wait before second auth check: %w", err))
+	}
+	status, exchanges, err := r.authCheckOnce(ctx, true)
+	if exchanges <= firstExchanges {
+		err = errors.Join(err, fmt.Errorf("federated token was not re-exchanged (exchanges: %d -> %d)", firstExchanges, exchanges))
+	}
+	if status != http.StatusOK {
+		err = errors.Join(err, fmt.Errorf("second auth check returned HTTP status %d, want 200", status))
+	}
+	return errors.Join(firstErr, err)
+}
+
+func (r runner) authCheckOnce(ctx context.Context, includeExchanges bool) (int, int, error) {
 	status, err := r.api.CheckAgents(ctx)
 	info, ok := r.auth.Info()
-	if !ok {
-		return err
+	if !ok && !includeExchanges {
+		return status, 0, err
 	}
-	printErr := json.NewEncoder(r.stdout).Encode(struct {
+	result := struct {
 		claudeauth.TokenInfo
-		HTTPStatus int `json:"http_status"`
-	}{info, status})
-	return errors.Join(err, printErr)
+		HTTPStatus int  `json:"http_status"`
+		Exchanges  *int `json:"exchanges,omitempty"`
+	}{TokenInfo: info, HTTPStatus: status}
+	if includeExchanges {
+		result.Exchanges = new(info.Exchanges)
+	}
+	printErr := json.NewEncoder(r.stdout).Encode(result)
+	return status, info.Exchanges, errors.Join(err, printErr)
 }
 
 func readJSON[T any](path string) (T, error) {

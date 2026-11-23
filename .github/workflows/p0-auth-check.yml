@@ -18,13 +18,16 @@ on:
       workspace_id:
         type: string
         required: true
+      hold_seconds:
+        type: string
+        default: ''
 
 permissions: {}
 
 jobs:
   auth-check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 25
     permissions:
       id-token: write
       contents: read
@@ -62,9 +65,19 @@ jobs:
           factory_commit="$(git -C factory rev-parse HEAD)"
           printf 'FACTORY_COMMIT=%s\n' "$factory_commit" >> "$GITHUB_ENV"
       - name: Check Anthropic federation
+        shell: bash
         env:
           ANTHROPIC_FEDERATION_RULE_ID: ${{ inputs.federation_rule_id }}
           ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
           ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ inputs.service_account_id }}
           ANTHROPIC_WORKSPACE_ID: ${{ inputs.workspace_id }}
-        run: 'exec "$RUNNER_TEMP/session" auth-check'
+          HOLD_SECONDS: ${{ inputs.hold_seconds }}
+        run: |
+          if [[ -z "$HOLD_SECONDS" ]]; then
+            exec "$RUNNER_TEMP/session" auth-check
+          fi
+          if [[ ! "$HOLD_SECONDS" =~ ^[0-9]{1,4}$ ]]; then
+            printf 'hold_seconds must be 1 to 4 digits\n' >&2
+            exit 1
+          fi
+          exec "$RUNNER_TEMP/session" auth-check -hold "${HOLD_SECONDS}s"

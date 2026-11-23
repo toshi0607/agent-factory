@@ -110,6 +110,110 @@ func TestAuthCheck(t *testing.T) {
 	}
 }
 
+func TestAuthCheckHold(t *testing.T) {
+	for _, tt := range []struct {
+		name, hold, wantError string
+		wantExchanges         []int
+		secondStatus          int
+	}{
+		{"zero", "0", "", []int{0}, 0},
+		{"refresh", "9m30s", "", []int{1, 2}, 200},
+		{"still cached", "9m", "federated token was not re-exchanged", []int{1, 1}, 200},
+		{"second status is not 200", "9m30s", "second auth check returned HTTP status 204, want 200", []int{1, 2}, 204},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := testClock()
+			var stdout bytes.Buffer
+			var exchanges, checks int
+			client := clientFor(func(req *http.Request) (int, string) {
+				switch req.URL.Path {
+				case "/oidc":
+					payload := base64.RawURLEncoding.EncodeToString([]byte(`{"job_workflow_sha":"` + factoryCommit + `"}`))
+					return 200, fmt.Sprintf(`{"value":%q}`, "fake-header."+payload+".fake-signature")
+				case "/v1/oauth/token":
+					exchanges++
+					return 200, fmt.Sprintf(`{"access_token":"fake-access-%d","token_type":"Bearer","expires_in":600,"scope":"agents:read"}`, exchanges)
+				case "/v1/agents":
+					if req.Header.Get("Authorization") != fmt.Sprintf("Bearer fake-access-%d", exchanges) {
+						t.Fatal("auth-check sent the wrong authorization header")
+					}
+					checks++
+					if checks == 1 {
+						return 200, `{"data":[]}`
+					}
+					if strings.Count(stdout.String(), "\n") != 1 || len(clock.sleeps) != 1 {
+						t.Fatal("second request must follow the first JSON line and hold")
+					}
+					return tt.secondStatus, ""
+				default:
+					t.Fatalf("unexpected path %s", req.URL.Path)
+					return 500, ""
+				}
+			})
+			const base = "https://api.example.invalid"
+			auth := claudeauth.NewFederation(base, client, claudeauth.Config{
+				OIDCURL: "https://github.example.invalid/oidc", OIDCRequestToken: "fake-oidc-placeholder",
+				FederationRuleID: "rule", OrganizationID: "org", ExpectedWorkflowSHA: factoryCommit, Now: clock.Now,
+			})
+			r := runner{api: claude.New(base, client, auth), auth: auth, clock: clock, stdout: &stdout}
+			err := r.run(t.Context(), []string{"auth-check", "-hold", tt.hold})
+			if tt.wantError == "" && err != nil || tt.wantError != "" && (err == nil || !strings.Contains(err.Error(), tt.wantError)) {
+				t.Fatalf("auth-check error = %v, want %q", err, tt.wantError)
+			}
+			hold, err := time.ParseDuration(tt.hold)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wantSleeps []time.Duration
+			if hold != 0 {
+				wantSleeps = []time.Duration{hold}
+			}
+			if checks != len(tt.wantExchanges) || !slices.Equal(clock.sleeps, wantSleeps) {
+				t.Fatalf("checks = %d, sleeps = %v", checks, clock.sleeps)
+			}
+			if strings.Contains(stdout.String(), "fake-") || strings.Count(stdout.String(), "\n") != checks {
+				t.Fatal("auth-check printed a credential or the wrong number of JSON lines")
+			}
+			var got []int
+			for line := range strings.SplitSeq(strings.TrimSuffix(stdout.String(), "\n"), "\n") {
+				var result struct {
+					claudeauth.TokenInfo
+					HTTPStatus int  `json:"http_status"`
+					Exchanges  *int `json:"exchanges"`
+				}
+				decode(t, []byte(line), &result)
+				wantStatus := 200
+				if len(got) == 1 {
+					wantStatus = tt.secondStatus
+				}
+				if result.HTTPStatus != wantStatus || result.ExpiresIn != 600 || result.Scope != "agents:read" {
+					t.Fatal("auth-check output does not contain the expected metadata")
+				}
+				if (hold == 0) != (result.Exchanges == nil) {
+					t.Fatal("auth-check must include exchanges only when holding")
+				}
+				count := 0
+				if result.Exchanges != nil {
+					count = *result.Exchanges
+				}
+				got = append(got, count)
+			}
+			if !slices.Equal(got, tt.wantExchanges) {
+				t.Fatalf("exchanges = %v, want %v", got, tt.wantExchanges)
+			}
+		})
+	}
+}
+
+func TestAuthCheckRejectsInvalidHold(t *testing.T) {
+	for _, hold := range []string{"-1s", "20m1ns"} {
+		if err := (runner{}).run(t.Context(), []string{"auth-check", "-hold", hold}); err == nil ||
+			!strings.Contains(err.Error(), "-hold must be between 0 and 20 minutes") {
+			t.Errorf("-hold %s: expected a validation error, got %v", hold, err)
+		}
+	}
+}
+
 func TestOIDCClaims(t *testing.T) {
 	const fakeRequestToken = "fake-request-placeholder"
 	payload := base64.RawURLEncoding.EncodeToString([]byte(`{
@@ -414,23 +518,30 @@ func TestCollect(t *testing.T) {
 	const running = `{"status":"running"}`
 	const initialIdle = `{"status":"idle","usage":{"active_seconds":0}}`
 	const terminated = `{"status":"terminated"}`
-	const events = `{"data":[{"type":"agent.message","content":[{"text":"DONE","type":"text"}]}]}`
+	const messageEvent = `{"type":"agent.message","content":[{"text":"DONE","type":"text"}]}`
+	const budgetEvent = `{"type":"session.status_idle","processed_at":"2026-11-19T07:16:49Z","stop_details":null,"stop_reason":{"type":"budget_reached"}}`
+	const endTurnEvent = `{"type":"session.status_idle","stop_reason":{"type":"end_turn"}}`
 	const patch = "test patch\n"
 	const paths = "added.go\nedit.go\n"
 	const probe = "== done\n"
 	for _, tc := range []struct {
 		name         string
 		sessions     []string
+		events       string
 		stopReason   string
 		missingPatch bool
 		wantSeconds  float64
 	}{
-		{"completed", []string{initialIdle, running, done, done}, stopCompleted, false, 20},
-		{"time limit", []string{running, running, running, done, done}, stopTimeLimit, false, 20},
-		{"missing patch", []string{terminated, terminated}, stopCompleted, true, 10},
-		{"never started", []string{initialIdle, initialIdle, initialIdle}, stopNeverStarted, false, 10},
+		{"completed", []string{initialIdle, running, done, done}, budgetEvent + "," + endTurnEvent, stopCompleted, false, 20},
+		{"budget reached", []string{done, done}, endTurnEvent + "," + budgetEvent + "," + messageEvent, "budget_reached", true, 10},
+		{"missing stop reason", []string{done, done}, budgetEvent + `,{"type":"session.status_idle"}`, stopCompleted, false, 0},
+		{"null stop reason", []string{done, done}, budgetEvent + `,{"type":"session.status_idle","stop_reason":null}`, stopCompleted, false, 0},
+		{"time limit", []string{running, running, running, done, done}, budgetEvent, stopTimeLimit, false, 20},
+		{"missing patch", []string{terminated, terminated}, messageEvent, stopCompleted, true, 10},
+		{"never started", []string{initialIdle, initialIdle, initialIdle}, messageEvent, stopNeverStarted, false, 10},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			events := `{"data":[` + tc.events + `]}`
 			out := t.TempDir()
 			statePath := filepath.Join(t.TempDir(), "state.json")
 			clock := testClock()

@@ -1,6 +1,11 @@
 name: Check Agent Factory P0 federation
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      hold_seconds:
+        type: string
+        description: Seconds to hold before a second check (blank skips)
 
 permissions: {}
 
@@ -17,3 +22,4 @@ jobs:
       organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
       service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
       workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+      hold_seconds: ${{ inputs.hold_seconds }}

@@ -107,7 +107,7 @@ func TestFederationRefresh(t *testing.T) {
 	if oidc != 2 || exchanges != 2 {
 		t.Fatalf("OIDC requests = %d, exchanges = %d", oidc, exchanges)
 	}
-	if info, ok := auth.Info(); !ok || info.ExpiresIn != 300 || info.Scope != "managed-agents" {
+	if info, ok := auth.Info(); !ok || info.ExpiresIn != 300 || info.Scope != "managed-agents" || info.Exchanges != 2 {
 		t.Fatal("wrong exchange metadata")
 	}
 }

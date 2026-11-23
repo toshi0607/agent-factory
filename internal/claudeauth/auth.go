@@ -41,6 +41,7 @@ type Config struct {
 	ServiceAccountID    string
 	WorkspaceID         string
 	ExpectedWorkflowSHA string
+	Now                 func() time.Time // Defaults to time.Now.
 }
 
 func ConfigFromEnv() Config {
@@ -58,6 +59,7 @@ func ConfigFromEnv() Config {
 type TokenInfo struct {
 	ExpiresIn int64  `json:"expires_in"`
 	Scope     string `json:"scope"`
+	Exchanges int    `json:"-"`
 }
 
 type Federation struct {
@@ -83,6 +85,9 @@ func NewFederation(base string, client *http.Client, cfg Config) *Federation {
 		cfg.Audience = defaultAudience
 	}
 	f := &Federation{client: *client, endpoint: strings.TrimRight(base, "/") + "/v1/oauth/token", cfg: cfg, now: time.Now}
+	if cfg.Now != nil {
+		f.now = cfg.Now
+	}
 	// Redirects could forward GitHub's bearer header or the JWT exchange body.
 	f.client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return f
@@ -103,7 +108,7 @@ func (f *Federation) Authorize(ctx context.Context, req *http.Request) error {
 	return nil
 }
 
-// Info returns metadata from the most recent successful exchange.
+// Info returns metadata from the most recent successful exchange and the total exchange count.
 func (f *Federation) Info() (TokenInfo, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -157,6 +162,7 @@ func (f *Federation) refresh(ctx context.Context) error {
 		return errors.New("Anthropic federation response has invalid token metadata")
 	}
 	exchange.Scope = redact(exchange.Scope, f.cfg.OIDCRequestToken, jwt, exchange.AccessToken, f.token)
+	exchange.Exchanges = f.info.Exchanges + 1
 	f.token = exchange.AccessToken
 	f.expiresAt = start.Add(time.Duration(exchange.ExpiresIn) * time.Second)
 	f.info = exchange.TokenInfo

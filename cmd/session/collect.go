@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ const (
 	interruptAttempts   = 3
 	interruptRetryDelay = 2 * time.Second
 	stopCompleted       = "completed"
+	stopBudgetReached   = "budget_reached"
 	stopTimeLimit       = "time_limit"
 	stopNeverStarted    = "never_started"
 	patchName           = "patch.diff"
@@ -82,6 +84,9 @@ func (r runner) collect(ctx context.Context, s state, out string) (resultErr err
 	} else if err := writeBytes(filepath.Join(out, "events.json"), events); err != nil {
 		notes = append(notes, fmt.Sprintf("could not save session events: %v", err))
 	}
+	if err == nil && stopReason == stopCompleted && lastIdleReachedBudget(events) {
+		stopReason = stopBudgetReached
+	}
 	final, err := r.api.GetSession(ctx, s.SessionID)
 	if err != nil {
 		return fmt.Errorf("read final session: %w", err)
@@ -139,6 +144,28 @@ func (r runner) collect(ctx context.Context, s state, out string) (resultErr err
 		return errors.Join(errors.New(webToolViolation), cleanupErr)
 	}
 	return cleanupErr
+}
+
+func lastIdleReachedBudget(events []byte) bool {
+	var page struct {
+		Data []struct {
+			Type       string          `json:"type"`
+			StopReason json.RawMessage `json:"stop_reason"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(events, &page); err != nil {
+		return false
+	}
+	for _, event := range slices.Backward(page.Data) {
+		if event.Type != "session.status_idle" {
+			continue
+		}
+		var reason struct {
+			Type string `json:"type"`
+		}
+		return json.Unmarshal(event.StopReason, &reason) == nil && reason.Type == stopBudgetReached
+	}
+	return false
 }
 
 func settled(status string) bool { return status == "idle" || status == "terminated" }
