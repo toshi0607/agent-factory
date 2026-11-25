@@ -107,7 +107,7 @@ describe("egress log limits", () => {
 function setup() {
   const data = new Map<string, unknown>();
   const db = new DatabaseSync(":memory:");
-  const kv = { get: data.get.bind(data), put: data.set.bind(data) };
+  const kv = { get: data.get.bind(data), put: data.set.bind(data), delete: data.delete.bind(data) };
   const sql = {
     exec(query: string, ...bindings: (string | number)[]) {
       const statement = db.prepare(query);
@@ -196,10 +196,11 @@ describe("Ledger metering and authorization", () => {
       expect(await ledger.authorize()).toEqual({ ok: true, token });
 
       const restarted = create();
-      expect(restarted.status().token.present).toBe(false);
+      expect(restarted.status().token.present).toBe(true);
       expect(restarted.budgetExhausted()).toBe(true);
-      expect(JSON.stringify({ state: [...data], status: ledger.status() })).not.toContain(token);
+      expect(JSON.stringify({ status: ledger.status(), restarted: restarted.status() })).not.toContain(token);
       ledger.deactivate(true);
+      expect(JSON.stringify([...data])).not.toContain(token);
       expect(ledger.setToken(token, 30)).toBeNull();
       expect(ledger.status().token).toEqual({ present: false, expires_at: null });
       const egressLog = ledger.egress();
@@ -253,6 +254,88 @@ describe("Ledger metering and authorization", () => {
       expect(await ledger.authorize(reservation("request"))).toEqual({ ok: true, token: refreshed });
     } finally {
       vi.useRealTimers();
+      close();
+    }
+  });
+});
+
+describe("token storage across Durable Object eviction", () => {
+  it("authorizes with a token set before the object was evicted", async () => {
+    const { create, close } = setup();
+    try {
+      // #given
+      const ledger = create();
+      const { model, egress, prices } = startRequest;
+      ledger.configure({ model, egress }, prices, 1);
+      const token = crypto.randomUUID();
+      ledger.setToken(token, 300);
+      // #when
+      const evicted = create();
+      // #then
+      expect(await evicted.authorize(reservation("request"))).toEqual({ ok: true, token });
+    } finally {
+      close();
+    }
+  });
+
+  it("returns no_token on a fresh object after the run is destroyed", async () => {
+    const { create, storage, close } = setup();
+    try {
+      // #given
+      const ledger = create();
+      const { model, egress, prices } = startRequest;
+      ledger.configure({ model, egress }, prices, 1);
+      ledger.setToken(crypto.randomUUID(), 300);
+      // #when
+      ledger.deactivate(true);
+      const evicted = create();
+      // #then
+      expect(evicted.status().token).toEqual({ present: false, expires_at: null });
+      expect(new TokenMemory(storage.kv as unknown as SyncKvStorage).authorize(Date.now())).toEqual({ ok: false, reason: "no_token" });
+    } finally {
+      close();
+    }
+  });
+
+  it("reports an expired stored token as token_expired and removes the credential", async () => {
+    const { create, data, close } = setup();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      // #given
+      const ledger = create();
+      const { model, egress, prices } = startRequest;
+      ledger.configure({ model, egress }, prices, 1);
+      const token = crypto.randomUUID();
+      const now = Date.now();
+      ledger.setToken(token, 30);
+      vi.setSystemTime(now + 30_000);
+      // #when
+      const evicted = create();
+      const first = await evicted.authorize(reservation("first"));
+      const second = await create().authorize(reservation("second"));
+      // #then
+      expect([first, second]).toEqual([
+        { ok: false, reason: "token_expired" }, { ok: false, reason: "token_expired" },
+      ]);
+      expect(JSON.stringify([...data])).not.toContain(token);
+    } finally {
+      vi.useRealTimers();
+      close();
+    }
+  });
+
+  it("never exposes the stored token in status on a fresh object", () => {
+    const { create, close } = setup();
+    try {
+      // #given
+      const token = crypto.randomUUID();
+      create().setToken(token, 300);
+      // #when
+      const status = create().status();
+      // #then
+      expect(status.token.present).toBe(true);
+      expect(JSON.stringify(status)).not.toContain(token);
+    } finally {
       close();
     }
   });

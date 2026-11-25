@@ -628,4 +628,47 @@ printf '\r\n%s\n' "$code"
 			}
 		})
 	}
+	for _, tc := range []struct {
+		name         string
+		files        []string
+		envVerdict   string
+		filesVerdict string
+		want         []string
+	}{
+		{"claude code env and harmless agent state", []string{"settings.json", "projects/session.jsonl"}, "PASS", "PASS",
+			[]string{"~/.claude -> yes (agent state)\n  projects\n  projects/session.jsonl\n  settings.json\n"}},
+		{"stored credential in agent state", []string{".credentials.json"}, "PASS", "FAIL",
+			[]string{"~/.claude -> yes (agent state)\n  .credentials.json\n"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// #given
+			agentHome := filepath.Join(dir, strings.ReplaceAll(tc.name, " ", "-"))
+			for _, file := range tc.files {
+				if err := os.MkdirAll(filepath.Dir(filepath.Join(agentHome, ".claude", file)), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				write(t, filepath.Join(agentHome, ".claude", file), "fixture-agent-state-body")
+			}
+			env := []string{"PATH=" + bin + ":/usr/bin:/bin", "HOME=" + agentHome, "FACTORY_OUT_DIR=" + out,
+				"FACTORY_CANDIDATE=cloudflare-sandbox", "SCENARIO=pass", "ANTHROPIC_API_KEY=provided-by-worker",
+				"ANTHROPIC_MODEL=claude-test", "CLAUDECODE=1", "CLAUDE_CODE_CHILD_SESSION=1",
+				"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1", "CLAUDE_CODE_ENTRYPOINT=cli", "CLAUDE_CODE_EXECPATH=/fixture",
+				"CLAUDE_CODE_SESSION_ATTENDED=0", "CLAUDE_CODE_SESSION_ID=fixture-session", "CLAUDE_CODE_SIMPLE=1",
+				"CLAUDE_EFFORT=medium", "CLAUDE_PID=1"}
+			// #when
+			run(t, "", env, "bash", "probe.sh")
+			result := read(t, filepath.Join(out, "probe.txt"))
+			// #then
+			if strings.Contains(result, "fixture-agent-state-body") || strings.Contains(result, "fixture-session") {
+				t.Fatal("probe disclosed agent state contents or an environment value")
+			}
+			want := append([]string{"CLAUDECODE\n", "CLAUDE_CODE_SESSION_ID\n", "CLAUDE_EFFORT\n", "CLAUDE_PID\n",
+				"no_credential_env " + tc.envVerdict + "\n", "no_credential_files " + tc.filesVerdict + "\n"}, tc.want...)
+			for _, w := range want {
+				if !strings.Contains(result, w) {
+					t.Errorf("missing %q in Cloudflare probe", w)
+				}
+			}
+		})
+	}
 }

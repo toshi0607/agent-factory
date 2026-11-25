@@ -52,28 +52,55 @@ export function countEgress(
   return next;
 }
 
+const TOKEN_KEY = "token";
+
+interface StoredToken {
+  token?: string;
+  expiresAt: number;
+}
+
+type TokenStorage = Pick<SyncKvStorage, "get" | "put" | "delete">;
+
+function memoryStorage(): TokenStorage {
+  const values = new Map<string, unknown>();
+  return {
+    get: <T>(key: string) => values.get(key) as T | undefined,
+    put: (key, value) => { values.set(key, value); },
+    delete: key => values.delete(key),
+  };
+}
+
 export class TokenMemory {
-  #value: { token: string; expiresAt: number } | undefined;
+  // Kept in Durable Object storage because Cloudflare evicts an idle object from memory after about 10 seconds.
+  readonly #storage: TokenStorage;
+
+  constructor(storage: TokenStorage = memoryStorage()) {
+    this.#storage = storage;
+  }
 
   set(token: string, seconds: number, now: number): TokenInfo {
-    this.#value = { token, expiresAt: now + seconds * 1000 };
+    this.#storage.put(TOKEN_KEY, { token, expiresAt: now + seconds * 1000 } satisfies StoredToken);
     return this.status(now);
   }
 
   status(now: number): TokenInfo {
-    const expiresAt = this.#value?.expiresAt;
+    const expiresAt = this.#storage.get<StoredToken>(TOKEN_KEY)?.expiresAt;
     return { present: expiresAt !== undefined && expiresAt > now, expires_at: expiresAt === undefined
       ? null : new Date(expiresAt).toISOString() };
   }
 
   authorize(now: number): Authorization {
-    if (!this.#value) return { ok: false, reason: "no_token" };
-    if (this.#value.expiresAt <= now) return { ok: false, reason: "token_expired" };
-    return { ok: true, token: this.#value.token };
+    const value = this.#storage.get<StoredToken>(TOKEN_KEY);
+    if (!value) return { ok: false, reason: "no_token" };
+    if (value.expiresAt <= now || value.token === undefined) {
+      if (value.token !== undefined) this.#storage.put(TOKEN_KEY, { expiresAt: value.expiresAt } satisfies StoredToken);
+      return { ok: false, reason: "token_expired" };
+    }
+    return { ok: true, token: value.token };
   }
 
   clear(): void {
-    this.#value = undefined;
+    this.#storage.delete(TOKEN_KEY);
   }
 }
 
@@ -90,10 +117,11 @@ interface MeterTotals {
 }
 
 export class Ledger extends DurableObject<Env> {
-  readonly #token = new TokenMemory();
+  readonly #token: TokenMemory;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.#token = new TokenMemory(ctx.storage.kv);
     ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS egress (id INTEGER PRIMARY KEY, entry TEXT NOT NULL)");
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS inflight (
       request_id TEXT PRIMARY KEY, estimate_microcents INTEGER NOT NULL, started_at INTEGER NOT NULL

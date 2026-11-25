@@ -22,6 +22,20 @@ scan_files() {
     )
 }
 
+probe_agent_state() (
+  local root=$1 entry name count=0 status=0
+  shopt -s nocasematch
+  while IFS= read -r -d '' entry; do
+    entry=${entry#"$root"/}
+    name=${entry##*/}
+    ((count++ < 30)) && printf '  %q\n' "$entry"
+    if [[ $name == *credential* || $name == *token* || $name == *.pem || $name == *.key || $name == auth*.json ]]; then
+      status=1
+    fi
+  done < <(find -H "$root" -mindepth 1 -maxdepth 2 -print0 2>/dev/null | LC_ALL=C sort -z)
+  exit "$status"
+)
+
 probe_url() {
   local url=$1 code status=0
   code=$(command curl --disable --silent --max-time 15 --output /dev/null --write-out '%{http_code}' -- "$url" 2>/dev/null) || status=$?
@@ -298,6 +312,7 @@ probe_token_request() {
   platform_names=${PROBE_PLATFORM_ENV_NAMES-ANTHROPIC_COMMIT_TOKEN ANTHROPIC_COMMIT_SIGN_URL}
   if [[ $candidate == cloudflare-sandbox ]]; then
     platform_names='ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'
+    platform_names+=' CLAUDECODE CLAUDE_EFFORT CLAUDE_PID'
   fi
   platform_present=()
   while IFS= read -r name; do
@@ -312,7 +327,8 @@ probe_token_request() {
       fi
       continue
     fi
-    if [[ " $platform_names " == *" $name "* || ( $candidate == cloudflare-sandbox && $name == CLOUDFLARE_* ) ]]; then
+    if [[ " $platform_names " == *" $name "* ||
+      ( $candidate == cloudflare-sandbox && ( $name == CLOUDFLARE_* || $name == CLAUDE_CODE_* ) ) ]]; then
       platform_present+=("$name")
       platform=true
     fi
@@ -333,6 +349,11 @@ probe_token_request() {
   for file in .netrc .git-credentials .config/gh/hosts.yml .config/gcloud .aws .ssh \
     .docker/config.json .anthropic .claude .codex; do
     if [[ -n $home && ( -e "$home/$file" || -L "$home/$file" ) ]]; then
+      if [[ $candidate == cloudflare-sandbox && $file == .claude ]]; then
+        printf '~/%s -> yes (agent state)\n' "$file"
+        probe_agent_state "$home/$file" || no_credential_files=FAIL
+        continue
+      fi
       printf '~/%s -> yes\n' "$file"
       no_credential_files=FAIL
     else
