@@ -35,6 +35,7 @@ it("keeps the fixed Claude command and environment", () => {
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-example",
         "ANTHROPIC_MODEL": "claude-example",
         "ANTHROPIC_SMALL_FAST_MODEL": "claude-example",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "DISABLE_AUTOUPDATER": "1",
         "DISABLE_TELEMETRY": "1",

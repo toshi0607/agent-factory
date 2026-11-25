@@ -24,6 +24,7 @@ export function agentCommand({ model, systemPromptPath, userMessage }: AgentInpu
       ANTHROPIC_SMALL_FAST_MODEL: model,
       ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+      CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
       DISABLE_AUTOUPDATER: "1",
       DISABLE_TELEMETRY: "1",
       HOME: "/home/agent",
