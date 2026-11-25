@@ -31,16 +31,26 @@ read-only hosts use ordinary upstream fetches.
 
 ## Deployment inputs
 
-Use `wrangler.jsonc` in a Cloudflare account with Workers, SQLite Durable
-Objects, and Containers enabled. Supply `OIDC_AUDIENCE`,
-`ALLOWED_REPOSITORY_ID`, `ALLOWED_REPOSITORY_OWNER_ID`,
-`ALLOWED_JOB_WORKFLOWS`, `ALLOWED_REFS`, and `FACTORY_COMMIT` at deploy time with `--var`.
-Set `ALLOWED_JOB_WORKFLOWS` to comma-separated workflow paths without refs.
-Set `ALLOWED_REFS` (empty placeholder `ALLOWED_REFS=""`) to comma-separated exact
-GitHub OIDC refs such as `refs/heads/main`. The run and attempt that first
+Deploy with the Cloudflare CLI (`cf`), which reads `cloudflare.config.ts`:
+
+```sh
+npx cf deploy
+```
+
+The configuration takes its deployment values from the environment of that
+process and refuses to evaluate when one is missing: `FACTORY_OIDC_AUDIENCE`,
+`FACTORY_ALLOWED_REPOSITORY_ID`, `FACTORY_ALLOWED_REPOSITORY_OWNER_ID`,
+`FACTORY_ALLOWED_JOB_WORKFLOWS` (comma-separated workflow paths without refs),
+`FACTORY_ALLOWED_REFS`, and `FACTORY_COMMIT`. `wrangler.jsonc` describes the
+same Worker for reference; `wrangler.dev.jsonc` is still what local development
+uses.
+
+
+The Cloudflare account needs Workers, SQLite Durable Objects, and Containers
+enabled.
+`FACTORY_ALLOWED_REFS` holds comma-separated exact GitHub OIDC refs such as
+`refs/heads/main`. The run and attempt that first
 claim a run may upload files and start it. Other authenticated callers from
 the same repository may read, refresh the token, stop, or delete it.
 The caller provides and refreshes the short-lived Claude token through
-`PUT /runs/{id}/token`. If the caller ships the current repository
-`sandbox/setup.sh`, that script also requires a Go archive in the delivery
-manifest, even though the container includes Go at `/opt/go`.
+`PUT /runs/{id}/token`.
