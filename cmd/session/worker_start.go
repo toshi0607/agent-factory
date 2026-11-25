@@ -144,7 +144,7 @@ func (r runner) pushWorkerToken(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("get federated token for worker: %w", err)
 	}
-	if err := r.worker.PutToken(ctx, id, token, min(seconds, 86400)); err != nil {
+	if err := r.worker.PutToken(ctx, id, token, min(seconds, 900)); err != nil {
 		return fmt.Errorf("push federated token to worker: %w", err)
 	}
 	return nil

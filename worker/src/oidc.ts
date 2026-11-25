@@ -3,11 +3,12 @@ import { object, type Caller, type OidcEnv } from "./types";
 const ISSUER = "https://token.actions.githubusercontent.com";
 const JWKS_URL = "https://token.actions.githubusercontent.com/.well-known/jwks";
 const CACHE_MS = 10 * 60_000;
+const MAX_KEY_AGE_MS = 60 * 60_000;
 const REFRESH_MS = 60_000;
 const RSA = "RSASSA-PKCS1-v1_5";
 
 type AuthError = "misconfigured" | "invalid_token" | "wrong_audience" | "wrong_repository"
-  | "wrong_workflow" | "wrong_ref" | "expired";
+  | "wrong_workflow" | "wrong_ref" | "expired" | "unavailable";
 
 export type Verification = { ok: true; caller: Caller } | { ok: false; error: AuthError };
 export type Verify = (authorization: string | null, env: OidcEnv) => Promise<Verification>;
@@ -73,15 +74,19 @@ function claims(payload: Record<string, unknown>, env: OidcEnv, seconds: number)
 
 export function createVerifier(fetchJwks: () => Promise<unknown>, now = Date.now): Verify {
   let keys: unknown[] | undefined;
-  let expiresAt = 0;
+  let fetchedAt = -Infinity;
   let unknownRefreshAt = -Infinity;
 
-  async function refresh(): Promise<unknown[]> {
-    const fetched = object(await fetchJwks())?.keys;
-    if (!Array.isArray(fetched)) throw new Error("invalid JWKS");
-    keys = fetched;
-    expiresAt = now() + CACHE_MS;
-    return fetched;
+  async function refresh(): Promise<unknown[] | undefined> {
+    try {
+      const fetched = object(await fetchJwks())?.keys;
+      if (!Array.isArray(fetched)) throw new Error("invalid JWKS");
+      keys = fetched;
+      fetchedAt = now();
+      return fetched;
+    } catch {
+      return now() <= fetchedAt + MAX_KEY_AGE_MS ? keys : undefined;
+    }
   }
 
   function findKey(jwks: unknown[], kid: string): Record<string, unknown> | undefined {
@@ -89,13 +94,16 @@ export function createVerifier(fetchJwks: () => Promise<unknown>, now = Date.now
     return matching.length === 1 ? matching[0] : undefined;
   }
 
-  async function selectKey(kid: string): Promise<JsonWebKey | undefined> {
-    const previous = keys;
-    const jwks = previous && now() < expiresAt ? previous : await refresh();
+  async function selectKey(kid: string): Promise<JsonWebKey | "unavailable" | undefined> {
+    const cached = now() < fetchedAt + CACHE_MS ? keys : undefined;
+    let jwks = cached ?? await refresh();
+    if (!jwks) return "unavailable";
     let key = findKey(jwks, kid);
-    if (!key && jwks === previous && now() >= unknownRefreshAt) {
+    if (!key && cached && now() >= unknownRefreshAt) {
       unknownRefreshAt = now() + REFRESH_MS;
-      key = findKey(await refresh(), kid);
+      jwks = await refresh();
+      if (!jwks) return "unavailable";
+      key = findKey(jwks, kid);
     }
     if (key?.kty !== "RSA" || typeof key.n !== "string" || typeof key.e !== "string"
       || (key.use !== undefined && key.use !== "sig")
@@ -124,6 +132,7 @@ export function createVerifier(fetchJwks: () => Promise<unknown>, now = Date.now
       if (header?.alg !== "RS256" || typeof header.kid !== "string" || !header.kid
         || header.crit !== undefined) return fail("invalid_token");
       const jwk = await selectKey(header.kid);
+      if (jwk === "unavailable") return fail(jwk);
       if (!jwk) return fail("invalid_token");
       const key = await crypto.subtle.importKey("jwk", jwk, { name: RSA, hash: "SHA-256" }, false, ["verify"]);
       const input = new TextEncoder().encode(`${encodedHeader}.${encodedPayload}`);

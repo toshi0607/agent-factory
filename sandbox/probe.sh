@@ -327,11 +327,16 @@ probe_token_request() {
       fi
       continue
     fi
-    if [[ " $platform_names " == *" $name "* ||
-      ( $candidate == cloudflare-sandbox && ( $name == CLOUDFLARE_* || $name == CLAUDE_CODE_* ) &&
-        ! $name =~ (KEY|TOKEN|SECRET|CREDENTIAL|PASSWORD) ) ]]; then
-      platform_present+=("$name")
+    if [[ " $platform_names " == *" $name "* ]]; then
       platform=true
+    elif [[ $candidate == cloudflare-sandbox && ( $name == CLOUDFLARE_* || $name == CLAUDE_CODE_* ) ]]; then
+      shopt -s nocasematch
+      if [[ ! $name =~ (KEY|TOKEN|SECRET|CREDENTIAL|PASSWORD|AUTH|BEARER|COOKIE) ]]; then
+        platform=true
+      fi
+    fi
+    if [[ $platform == true ]]; then
+      platform_present+=("$name")
     fi
     shopt -s nocasematch
     if [[ $name =~ $credential_name ]]; then

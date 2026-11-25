@@ -1,7 +1,30 @@
 import { readFileSync } from "node:fs";
 import { URL } from "node:url";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
+import config from "../cloudflare.config";
 import { agentCommand } from "../src/agent";
+
+it("trims required deployment environment values before binding them", () => {
+  const values = {
+    OIDC_AUDIENCE: "example-audience",
+    ALLOWED_REPOSITORY_ID: "123",
+    ALLOWED_REPOSITORY_OWNER_ID: "456",
+    ALLOWED_JOB_WORKFLOWS: "example/factory/.github/workflows/example.yml",
+    ALLOWED_REFS: "refs/heads/main",
+    FACTORY_COMMIT: "abc",
+  };
+  try {
+    for (const [name, value] of Object.entries(values)) {
+      vi.stubEnv(name === "FACTORY_COMMIT" ? name : `FACTORY_${name}`, ` ${value}\n`);
+    }
+    const bindings = config().worker.env;
+    for (const [name, value] of Object.entries(values)) {
+      expect(bindings[name as keyof typeof values].value).toBe(value);
+    }
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
 
 it("keeps the fixed Claude command and environment", () => {
   expect(agentCommand({

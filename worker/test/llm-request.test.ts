@@ -125,3 +125,8 @@ it("accepts the per-turn system message Claude Code appends and rejects other sh
   expect(validate({ messages: [...turns, { role: "developer", content: [] }] }))
     .toEqual({ ok: false, reason: "message" });
 });
+
+it.each(["user", "assistant"])("rejects message-level output_config on a %s message", role => {
+  expect(validate({ messages: [{ role, content: [], output_config: { effort: "medium" } }] }))
+    .toEqual({ ok: false, reason: "message" });
+});

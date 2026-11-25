@@ -4,8 +4,8 @@ const WORKER_NAME = "agent-factory-p0";
 
 // Deployment values are not committed. They come from the environment of the `cf deploy` process.
 function required(name: string): string {
-	const value = process.env[name];
-	if (value === undefined || value.trim() === "") {
+	const value = process.env[name]?.trim();
+	if (!value) {
 		throw new Error(`${name} must be set to deploy ${WORKER_NAME}`);
 	}
 	return value;

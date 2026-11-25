@@ -334,8 +334,14 @@ export class Run extends DurableObject<Env> {
     return this.#serialize(async () => {
       const data = this.ctx.storage.kv.get<RunData>(RUN_KEY);
       if (!data || data.state === "destroyed") return;
-      if (data.destroyRequested || data.state === "finished" || data.state === "lost") {
+      if (data.destroyRequested) {
         await this.#destroy(data);
+        return;
+      }
+      if (data.state === "finished" || data.state === "lost") {
+        const expiry = data.finished_at === null ? 0 : Date.parse(data.finished_at) + RETENTION_MS;
+        if (Date.now() >= expiry) await this.#destroy(data);
+        else await this.ctx.storage.setAlarm(expiry);
         return;
       }
       if (isForced(data.stop_reason)) {

@@ -90,12 +90,15 @@ func TestWorkerErrorSanitizationAndRedirect(t *testing.T) {
 		case 4:
 			w.WriteHeader(403)
 			fmt.Fprint(w, `{"error":"wrong_run"}`)
+		case 5:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"error":"unavailable","message":"Key set unavailable"}`)
 		}
 	})
 	for i, want := range []struct {
 		status int
 		code   string
-	}{{400, "invalid_token_request"}, {400, ""}, {307, ""}, {401, "wrong_ref"}, {403, "wrong_run"}} {
+	}{{400, "invalid_token_request"}, {400, ""}, {307, ""}, {401, "wrong_ref"}, {403, "wrong_run"}, {503, "unavailable"}} {
 		response.Store(int32(i))
 		err := c.PutToken(t.Context(), testID, opaque, 600)
 		apiErr, ok := errors.AsType[*HTTPError](err)

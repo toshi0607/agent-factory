@@ -198,6 +198,35 @@ describe("Run lifecycle", () => {
     expect(storage.deleteAlarm).toHaveBeenCalled();
   });
 
+  it("retains outputs when an alarm arrives just after a caller stops the run", async () => {
+    const { run, start, upload, toBytes, storage, container } = fixture();
+    await upload("finish.sh");
+    await start();
+    disk.set("/factory/out/patch.diff", toBytes("partial patch"));
+    await run.stop("cancelled");
+    const finishedAt = Date.now();
+    storage.setAlarm.mockClear();
+
+    await run.alarm();
+
+    expect((await run.status()).state).toBe("finished");
+    expect(container.destroy).not.toHaveBeenCalled();
+    expect(await (await run.output("patch.diff")).text()).toBe("partial patch");
+    expect(storage.setAlarm).toHaveBeenCalledExactlyOnceWith(finishedAt + 600_000);
+  });
+
+  it("destroys a stopped run when its retention period elapses", async () => {
+    const { run, start, container } = fixture();
+    await start();
+    await run.stop("cancelled");
+    vi.setSystemTime(Date.now() + 600_000);
+
+    await run.alarm();
+
+    expect((await run.status()).state).toBe("destroyed");
+    expect(container.destroy).toHaveBeenCalledOnce();
+  });
+
   it.each(["time_limit", "budget_reached", "cancelled"] as const)("preserves %s and collects partial outputs", async reason => {
     const { run, start, container, ledger, upload, toBytes } = fixture();
     await upload("finish.sh");

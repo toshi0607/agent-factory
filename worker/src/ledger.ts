@@ -130,7 +130,8 @@ export class Ledger extends DurableObject<Env> {
   }
 
   setToken(token: string, seconds: number): TokenInfo | null {
-    if (this.ctx.storage.kv.get("closed")) return null;
+    const kv = this.ctx.storage.kv;
+    if (kv.get("closed") || kv.get("inactive")) return null;
     return this.#token.set(token, seconds, Date.now());
   }
 
@@ -146,8 +147,8 @@ export class Ledger extends DurableObject<Env> {
   }
 
   deactivate(destroy: boolean): void {
+    this.#token.clear();
     if (destroy) {
-      this.#token.clear();
       this.ctx.storage.kv.put("closed", true);
     }
     this.ctx.storage.kv.put("inactive", true);

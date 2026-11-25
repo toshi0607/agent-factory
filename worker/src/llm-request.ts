@@ -65,7 +65,7 @@ function walk(value: unknown, kind: Content, depth: number): string | undefined 
   if (kind === "content" || kind === "messages") return kind;
   if (kind === "message") {
     if (!fields || !has(MESSAGE_ROLES, fields.role)) return "message";
-    if ("output_config" in fields && !object(fields.output_config)) return "message";
+    if ("output_config" in fields && (fields.role !== "system" || !object(fields.output_config))) return "message";
     return keys(fields, MESSAGE_KEYS) ?? walk(fields.content, "content", depth + 1);
   }
   if (kind === "block") {

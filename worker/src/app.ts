@@ -40,7 +40,7 @@ const startSchema = z.strictObject({
 });
 const tokenSchema = z.strictObject({
   access_token: z.string().min(20).max(4096).regex(/^[\x21-\x7e]+$/),
-  expires_in: z.int().min(30).max(86400),
+  expires_in: z.int().min(30).max(900),
 });
 const stopSchema = z.strictObject({ reason: z.enum(["time_limit", "cancelled"]) });
 
@@ -100,6 +100,7 @@ export function createApp({ verify }: { verify: Verify }): ExportedHandler<Env> 
       try {
         const auth = await verify(request.headers.get("authorization"), env);
         if (!auth.ok) {
+          if (auth.error === "unavailable") return errorResponse(503, auth.error, "Key set unavailable");
           return errorResponse(auth.error === "misconfigured" ? 500 : 401, auth.error, messages[auth.error]);
         }
         const target = route(new URL(request.url).pathname);

@@ -156,6 +156,47 @@ describe("GitHub OIDC", () => {
     expect(fetcher).toHaveBeenCalledTimes(4);
   });
 
+  it("uses cached keys during a refresh failure for at most 60 minutes after fetching them", async () => {
+    let offset = 0;
+    const fetcher = vi.fn(async () => jwks());
+    const verify = createVerifier(fetcher, () => time * 1000 + offset);
+    expect((await verify(await jwt(), env)).ok).toBe(true);
+    fetcher.mockRejectedValue(new Error("JWKS request failed"));
+    offset = 60 * 60_000;
+    const recent = { iat: time + 3590, nbf: time + 3590, exp: time + 4500 };
+    expect((await verify(await jwt(recent), env)).ok).toBe(true);
+    expect(await verify(await jwt(recent, { kid: "unknown" }), env)).toEqual({ ok: false, error: "invalid_token" });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    offset += 1;
+    expect(await verify(await jwt(recent), env)).toEqual({ ok: false, error: "unavailable" });
+  });
+
+  it.each([
+    ["a fetch rejection", async () => { throw new Error("JWKS request failed"); }],
+    ["a malformed key set", async () => ({ keys: {} })],
+  ] as const)("returns 503 on a cold cache after %s", async (_scenario, fetcher) => {
+    const app = createApp({ verify: createVerifier(fetcher, () => time * 1000) });
+    const request = new Request("https://worker.invalid/no-route", {
+      headers: { authorization: await jwt() },
+    }) as Parameters<NonNullable<typeof app.fetch>>[0];
+    const response = await app.fetch!(request, env as Env, {} as ExecutionContext);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "unavailable", message: "Key set unavailable" });
+  });
+
+  it("returns 401 for a bad signature", async () => {
+    const signed = await jwt();
+    const index = signed.lastIndexOf(".") + 1;
+    const tampered = signed.slice(0, index) + (signed[index] === "A" ? "B" : "A") + signed.slice(index + 1);
+    const app = createApp({ verify: verifier() });
+    const request = new Request("https://worker.invalid/no-route", {
+      headers: { authorization: tampered },
+    }) as Parameters<NonNullable<typeof app.fetch>>[0];
+    const response = await app.fetch!(request, env as Env, {} as ExecutionContext);
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: "invalid_token", message: "Invalid token" });
+  });
+
   it.each(Object.keys(env) as (keyof OidcEnv)[])("returns 500 when %s is empty or absent", async key => {
     const signed = await jwt();
     const app = createApp({ verify: verifier() });

@@ -33,6 +33,11 @@ const (
 
 func workerTestRunner(t *testing.T, clock *fakeClock, handle http.HandlerFunc) runner {
 	t.Helper()
+	return workerTestRunnerWithTokenLifetime(t, clock, 600, handle)
+}
+
+func workerTestRunnerWithTokenLifetime(t *testing.T, clock *fakeClock, expiresIn int, handle http.HandlerFunc) runner {
+	t.Helper()
 	httpClient := &http.Client{Transport: transportFunc(func(req *http.Request) (*http.Response, error) {
 		if req.Body != nil {
 			defer req.Body.Close()
@@ -59,7 +64,7 @@ func workerTestRunner(t *testing.T, clock *fakeClock, handle http.HandlerFunc) r
 				!strings.HasSuffix(payload.Assertion, ".claude-federation-test") {
 				t.Fatal("Claude exchange received the wrong credential")
 			}
-			fmt.Fprintf(w, `{"access_token":%q,"token_type":"Bearer","expires_in":600}`, testAccessToken)
+			fmt.Fprintf(w, `{"access_token":%q,"token_type":"Bearer","expires_in":%d}`, testAccessToken, expiresIn)
 		default:
 			if req.URL.Host != strings.TrimPrefix(testWorkerBase, "https://") ||
 				!strings.HasSuffix(req.Header.Get("Authorization"), "."+testWorkerAudience) {
@@ -393,6 +398,27 @@ func TestWorkerCleanupFromStateAndEnvironment(t *testing.T) {
 	}
 	if !slices.Equal(calls, []string{"GET /oidc", "DELETE /runs/" + s.WorkID}) {
 		t.Fatalf("cleanup requests = %v", calls)
+	}
+}
+
+func TestWorkerTokenLifetimeCap(t *testing.T) {
+	clock := testClock()
+	id := sessionState(clock.Now()).WorkID
+	r := workerTestRunnerWithTokenLifetime(t, clock, 1200, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPut || req.URL.Path != "/runs/"+id+"/token" {
+			t.Fatal("incorrect worker token route")
+		}
+		var payload struct {
+			ExpiresIn int `json:"expires_in"`
+		}
+		decode(t, readRequest(t, req), &payload)
+		if payload.ExpiresIn != 900 {
+			t.Errorf("expires_in = %d, want 900", payload.ExpiresIn)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	if err := r.pushWorkerToken(t.Context(), id); err != nil {
+		t.Fatal(err)
 	}
 }
 

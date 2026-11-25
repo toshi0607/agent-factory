@@ -628,6 +628,24 @@ printf '\r\n%s\n' "$code"
 			}
 		})
 	}
+	for _, name := range []string{
+		"CLAUDE_CODE_OAUTH_TOKEN", "CLOUDFLARE_API_TOKEN", "CLAUDE_CODE_oauth_token", "CLOUDFLARE_AUTH_HEADER",
+		"CLAUDE_CODE_Bearer", "CLOUDFLARE_cookie",
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := []string{"PATH=" + bin + ":/usr/bin:/bin", "HOME=" + home, "FACTORY_OUT_DIR=" + out,
+				"FACTORY_CANDIDATE=cloudflare-sandbox", "SCENARIO=pass", "ANTHROPIC_API_KEY=provided-by-worker",
+				"ANTHROPIC_MODEL=claude-test", name + "=" + invalidKey}
+			run(t, "", env, "bash", "probe.sh")
+			result := read(t, filepath.Join(out, "probe.txt"))
+			if !strings.Contains(result, "\n"+name+"\n") || !strings.Contains(result, "no_credential_env FAIL\n") {
+				t.Errorf("probe did not flag %s", name)
+			}
+			if strings.Contains(result, invalidKey) {
+				t.Fatal("probe disclosed a credential value")
+			}
+		})
+	}
 	for _, tc := range []struct {
 		name         string
 		files        []string
@@ -654,7 +672,7 @@ printf '\r\n%s\n' "$code"
 				"ANTHROPIC_MODEL=claude-test", "CLAUDECODE=1", "CLAUDE_CODE_CHILD_SESSION=1",
 				"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1", "CLAUDE_CODE_ENTRYPOINT=cli", "CLAUDE_CODE_EXECPATH=/fixture",
 				"CLAUDE_CODE_SESSION_ATTENDED=0", "CLAUDE_CODE_SESSION_ID=fixture-session", "CLAUDE_CODE_SIMPLE=1",
-				"CLAUDE_EFFORT=medium", "CLAUDE_PID=1"}
+				"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1", "CLAUDE_EFFORT=medium", "CLAUDE_PID=1"}
 			// #when
 			run(t, "", env, "bash", "probe.sh")
 			result := read(t, filepath.Join(out, "probe.txt"))

@@ -157,6 +157,7 @@ describe("Worker HTTP API", () => {
       { access_token: access_token + " a", expires_in: 30 },
       { access_token: access_token + "\x1f", expires_in: 30 },
       { access_token, expires_in: 29 },
+      { access_token, expires_in: 901 },
       { access_token, expires_in: 86401 },
       { access_token, expires_in: 100.5 },
       { access_token, expires_in: "30" },
@@ -165,7 +166,7 @@ describe("Worker HTTP API", () => {
       expect((await send(path, { method: "PUT", body: JSON.stringify(invalid) })).status).toBe(400);
     }
     expect(token).not.toHaveBeenCalled();
-    for (const expires_in of [30, 86400]) {
+    for (const expires_in of [30, 900]) {
       expect((await send(path, { method: "PUT", body: JSON.stringify({ access_token, expires_in }) })).status).toBe(200);
       expect(token).toHaveBeenLastCalledWith(access_token, expires_in);
     }

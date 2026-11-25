@@ -297,6 +297,32 @@ describe("token storage across Durable Object eviction", () => {
     }
   });
 
+  it("clears the stored token on deactivation without destroying the run", () => {
+    const { create, data, close } = setup();
+    try {
+      const ledger = create();
+      ledger.setToken(crypto.randomUUID(), 300);
+      ledger.deactivate(false);
+
+      expect(data.has("token")).toBe(false);
+      expect(create().tokenStatus()).toEqual({ present: false, expires_at: null });
+    } finally {
+      close();
+    }
+  });
+
+  it("refuses a token update on an inactive ledger after eviction", () => {
+    const { create, data, close } = setup();
+    try {
+      create().deactivate(false);
+
+      expect(create().setToken(crypto.randomUUID(), 300)).toBeNull();
+      expect(data.has("token")).toBe(false);
+    } finally {
+      close();
+    }
+  });
+
   it("reports an expired stored token as token_expired and removes the credential", async () => {
     const { create, data, close } = setup();
     vi.useFakeTimers({ toFake: ["Date"] });
