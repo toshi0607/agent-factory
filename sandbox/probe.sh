@@ -328,7 +328,8 @@ probe_token_request() {
       continue
     fi
     if [[ " $platform_names " == *" $name "* ||
-      ( $candidate == cloudflare-sandbox && ( $name == CLOUDFLARE_* || $name == CLAUDE_CODE_* ) ) ]]; then
+      ( $candidate == cloudflare-sandbox && ( $name == CLOUDFLARE_* || $name == CLAUDE_CODE_* ) &&
+        ! $name =~ (KEY|TOKEN|SECRET|CREDENTIAL|PASSWORD) ) ]]; then
       platform_present+=("$name")
       platform=true
     fi
