@@ -137,7 +137,7 @@ export function createVerifier(fetchJwks: () => Promise<unknown>, now = Date.now
 }
 
 export async function fetchGitHubJwks(): Promise<unknown> {
-  const response = await fetch(JWKS_URL, { redirect: "error", signal: AbortSignal.timeout(5_000) });
+  const response = await fetch(JWKS_URL, { redirect: "manual", signal: AbortSignal.timeout(5_000) });
   if (!response.ok) throw new Error("JWKS request failed");
   return response.json();
 }
