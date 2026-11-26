@@ -29,6 +29,29 @@ egress:
     allowed_hosts:
       - proxy.golang.org
       - sum.golang.org
+  # PoC only: the module proxy limited to the modules named in the product's go.sum.
+  gomod-pinned:
+    allowed_hosts:
+      - sum.golang.org
+    path_rules:
+      - host: proxy.golang.org
+        path_prefixes:
+          - /cloud.google.com/go/cloudtasks/@v/
+          - /cloud.google.com/go/iam/@v/
+          - /cloud.google.com/go/longrunning/@v/
+          - /cloud.google.com/go/pubsub/v2/@v/
+          - /cloud.google.com/go/secretmanager/@v/
+          - /connectrpc.com/connect/v2/@v/
+          - /connectrpc.com/vanguard/@v/
+          - /go.yaml.in/yaml/v3/@v/
+          - /golang.org/x/net/@v/
+          - /golang.org/x/sys/@v/
+          - /golang.org/x/text/@v/
+          - /google.golang.org/genproto/@v/
+          - /google.golang.org/genproto/googleapis/api/@v/
+          - /google.golang.org/genproto/googleapis/rpc/@v/
+          - /google.golang.org/grpc/@v/
+          - /google.golang.org/protobuf/@v/
 roles:
   fixer:
     agent: claude
@@ -46,3 +69,11 @@ roles:
     budget:
       llm_usd_cents: 100
       minutes: 10
+  fixer-pinned:
+    agent: claude
+    model: claude-opus-5-5
+    prompt: prompts/fixer.md
+    egress: [gomod-pinned]
+    budget:
+      llm_usd_cents: 300
+      minutes: 30
