@@ -69,14 +69,16 @@ func (r runner) collect(ctx context.Context, s state, out string) (resultErr err
 		return err
 	}
 
+	var watch stopWatch
 	if stopping {
 		stopReason = stopStopped
 	} else {
 		deadline := s.StartedAt.Add(time.Duration(s.MinutesLimit) * time.Minute)
-		session, stopReason, resultErr = r.waitForCompletion(ctx, s.SessionID, s.StartedAt, deadline)
+		session, stopReason, resultErr = r.waitForCompletion(ctx, s.SessionID, s.StartedAt, deadline, &watch)
 		if resultErr != nil {
 			return resultErr
 		}
+		stopping = stopReason == stopStopped
 	}
 	interrupted := stopReason == stopTimeLimit || stopReason == stopStopped
 	if interrupted {
@@ -157,6 +159,9 @@ func (r runner) collect(ctx context.Context, s state, out string) (resultErr err
 		rec.Interruptions = record.Interruptions{Count: 1, Notes: []string{"Session time limit reached."}}
 	} else if stopping {
 		rec.Interruptions = record.Interruptions{Count: 1, Notes: []string{stoppedNote}}
+	}
+	if watch.failed {
+		rec.Interruptions.Notes = append(rec.Interruptions.Notes, stopCheckFailedNote)
 	}
 	if err := writeJSON(filepath.Join(out, "record.partial.json"), rec, delivery.WriteAtomic); err != nil {
 		return err
@@ -260,7 +265,7 @@ func (r runner) interruptAndWait(ctx context.Context, id string) (claude.Session
 	return session, errors.Join(interruptErr, waitErr)
 }
 
-func (r runner) waitForCompletion(ctx context.Context, id string, startedAt, deadline time.Time) (claude.Session, string, error) {
+func (r runner) waitForCompletion(ctx context.Context, id string, startedAt, deadline time.Time, watch *stopWatch) (claude.Session, string, error) {
 	for {
 		session, err := r.api.GetSession(ctx, id)
 		if err != nil {
@@ -272,6 +277,13 @@ func (r runner) waitForCompletion(ctx context.Context, id string, startedAt, dea
 		}
 		if session.Status == "idle" && session.Usage.ActiveSeconds == 0 && now.Sub(startedAt) > startupGrace {
 			return session, stopNeverStarted, nil
+		}
+		stopped, err := r.pollStop(ctx, watch)
+		if err != nil {
+			return claude.Session{}, "", err
+		}
+		if stopped {
+			return session, stopStopped, nil
 		}
 		remaining := deadline.Sub(now)
 		if remaining <= 0 {

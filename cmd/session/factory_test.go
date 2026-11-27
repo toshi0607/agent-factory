@@ -23,14 +23,23 @@ import (
 type fakeFactory struct {
 	stop       *factorystate.StopFlag
 	stoppedErr error
-	record     *factorystate.InProgress
-	generation int64
-	calls      []string
+	// stoppedErrs, when set, gives the error of each Stopped call in order;
+	// later calls fall back to stoppedErr.
+	stoppedErrs  []error
+	stoppedCalls int
+	record       *factorystate.InProgress
+	generation   int64
+	calls        []string
 }
 
 func (f *fakeFactory) Stopped(context.Context) (*factorystate.StopFlag, error) {
 	f.calls = append(f.calls, "Stopped")
-	return f.stop, f.stoppedErr
+	err := f.stoppedErr
+	if f.stoppedCalls < len(f.stoppedErrs) {
+		err = f.stoppedErrs[f.stoppedCalls]
+	}
+	f.stoppedCalls++
+	return f.stop, err
 }
 
 func (f *fakeFactory) Stop(_ context.Context, reason, setBy, workID string) (bool, error) {
@@ -320,6 +329,202 @@ func TestCollectStopCheckFailureStopsSession(t *testing.T) {
 	}
 	if !slices.Equal(calls, []string{"GET /v1/sessions/session-1"}) || factory.record == nil {
 		t.Fatalf("calls = %v, record = %+v; want a settled session kept for recovery", calls, factory.record)
+	}
+}
+
+func TestCollectRechecksStopFlagWhileWaiting(t *testing.T) {
+	const running = `{"status":"running"}`
+	const done = `{"status":"idle","usage":{"active_seconds":3}}`
+	storageErr := errors.New("storage unavailable")
+	wantCleanup := []string{"DELETE /v1/sessions/session-1", "POST /v1/agents/agent-1/archive",
+		"DELETE /v1/environments/env-1", "DELETE /v1/files/upload-1", "DELETE /v1/files/upload-2"}
+	statuses := func(runningPolls int) []string { return append(slices.Repeat([]string{running}, runningPolls), done) }
+	stopped := func(n int) []string { return slices.Repeat([]string{"Stopped"}, n) }
+	for _, tc := range []struct {
+		name       string
+		statuses   []string
+		stopAfter  time.Duration // the flag is set once the wait has run this long; zero means never
+		errs       []error
+		code       int
+		reason     string
+		interrupts int
+		notes      []string
+		calls      []string
+	}{
+		// Polls run every 10 seconds; checks run at 0s and 30s, and the flag is seen at 30s.
+		{"stopped while waiting", statuses(4), 25 * time.Second, nil, exitStopped, stopStopped, 1,
+			[]string{stoppedNote}, append(stopped(3), "End")},
+		// Running polls at 0s to 90s give checks at 0s, 30s, 60s, and 90s, plus the start-of-collect check.
+		{"never set", statuses(10), 0, nil, 0, stopCompleted, 0, []string{}, append(stopped(5), "End")},
+		{"transient check error", statuses(10), 0, []error{nil, storageErr}, 0, stopCompleted, 0,
+			[]string{stopCheckFailedNote}, append(stopped(5), "End")},
+		// Checks at 0s, 30s, and 60s fail; the failure path polls once more and interrupts.
+		{"three check errors", statuses(8), 0, []error{nil, storageErr, storageErr, storageErr}, exitStateError, "", 1,
+			nil, stopped(4)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := testClock()
+			s := sessionState(clock.Now())
+			s.MinutesLimit = 30
+			factory := &fakeFactory{record: &factorystate.InProgress{WorkID: s.WorkID, SessionID: s.SessionID}, generation: 3,
+				stoppedErrs: tc.errs}
+			out := t.TempDir()
+			var interrupts, gets int
+			var cleanup []string
+			handler := collectHandler(t, out, tc.statuses, &interrupts, &gets, &cleanup)
+			r := testRunner(func(req *http.Request) (int, string) {
+				if tc.stopAfter > 0 && clock.Now().Sub(s.StartedAt) >= tc.stopAfter {
+					factory.stop = &factorystate.StopFlag{Reason: "test"}
+				}
+				return handler(req)
+			}, clock)
+			r.factory = factory
+			err := r.collect(t.Context(), s, out)
+			if !slices.Equal(factory.calls, tc.calls) || interrupts != tc.interrupts {
+				t.Fatalf("state calls = %v, want %v; interrupts = %d", factory.calls, tc.calls, interrupts)
+			}
+			if tc.code == exitStateError {
+				if exitCode(err) != exitStateError || !strings.Contains(err.Error(), "storage unavailable") ||
+					!strings.Contains(err.Error(), "resources were kept") {
+					t.Fatalf("collect = %v (exit %d), want the fail-closed path", err, exitCode(err))
+				}
+				if _, statErr := os.Stat(filepath.Join(out, "record.partial.json")); !errors.Is(statErr, os.ErrNotExist) ||
+					len(cleanup) != 0 || factory.record == nil {
+					t.Fatalf("record stat = %v, cleanup = %v, record = %+v; want resources kept", statErr, cleanup, factory.record)
+				}
+				return
+			}
+			if (tc.code == 0 && err != nil) || (tc.code != 0 && exitCode(err) != tc.code) {
+				t.Fatalf("collect = %v (exit %d), want exit %d", err, exitCode(err), tc.code)
+			}
+			rec, readErr := readJSON[record.Record](filepath.Join(out, "record.partial.json"))
+			if readErr != nil || rec.Validate() != nil || rec.StopReason != tc.reason ||
+				rec.Interruptions.Count != tc.interrupts || !slices.Equal(rec.Interruptions.Notes, tc.notes) {
+				t.Fatalf("record = %+v, %v", rec, readErr)
+			}
+			if !slices.Equal(cleanup, wantCleanup) || factory.record != nil {
+				t.Fatalf("cleanup = %v, record = %+v", cleanup, factory.record)
+			}
+		})
+	}
+}
+
+func TestCollectWithoutStateSkipsStopChecks(t *testing.T) {
+	const running = `{"status":"running"}`
+	clock := testClock()
+	s := sessionState(clock.Now())
+	s.MinutesLimit = 30
+	out := t.TempDir()
+	var interrupts, gets int
+	var cleanup []string
+	statuses := append(slices.Repeat([]string{running}, 10), `{"status":"idle","usage":{"active_seconds":3}}`)
+	r := testRunner(collectHandler(t, out, statuses, &interrupts, &gets, &cleanup), clock)
+	if err := r.collect(t.Context(), s, out); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := readJSON[record.Record](filepath.Join(out, "record.partial.json"))
+	if err != nil || rec.StopReason != stopCompleted || interrupts != 0 || len(rec.Interruptions.Notes) != 0 {
+		t.Fatalf("record = %+v, %v; interrupts = %d", rec, err, interrupts)
+	}
+	var watch stopWatch
+	if stop, err := r.pollStop(t.Context(), &watch); stop || err != nil || watch.checked {
+		t.Fatalf("pollStop without state = %v, %v, checked = %v", stop, err, watch.checked)
+	}
+}
+
+func TestWorkerRechecksStopFlagWhileWaiting(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	for _, tc := range []struct {
+		name  string
+		errs  []error
+		code  int
+		calls []string
+	}{
+		{"stopped while waiting", nil, exitStopped, []string{"Stopped", "Stopped", "Stopped", "End"}},
+		{"three check errors", []error{nil, storageErr, storageErr, storageErr}, exitStateError,
+			[]string{"Stopped", "Stopped", "Stopped", "Stopped"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := testClock()
+			s := sessionState(clock.Now())
+			s.Candidate, s.MinutesLimit = workerCandidate, 30
+			factory := &fakeFactory{record: &factorystate.InProgress{WorkID: s.WorkID}, generation: 1, stoppedErrs: tc.errs}
+			out := t.TempDir()
+			var routes []string
+			var stoppedAt time.Time
+			r := workerTestRunner(t, clock, func(w http.ResponseWriter, req *http.Request) {
+				suffix := strings.TrimPrefix(req.URL.Path, "/runs/"+s.WorkID)
+				routes = append(routes, req.Method+" "+suffix)
+				switch {
+				case req.Method == http.MethodPost && suffix == "/stop":
+					if string(readRequest(t, req)) != `{"reason":"cancelled"}` {
+						t.Error("worker stop did not use the cancelled reason")
+					}
+					stoppedAt = clock.Now()
+					fmt.Fprint(w, `{"state":"finished","stop_reason":"cancelled"}`)
+				case req.Method == http.MethodGet && suffix == "":
+					if tc.errs == nil && clock.Now().Sub(s.StartedAt) >= 25*time.Second {
+						factory.stop = &factorystate.StopFlag{Reason: "test"}
+					}
+					state, reason := "running", ""
+					if !stoppedAt.IsZero() {
+						state, reason = "finished", "cancelled"
+					}
+					fmt.Fprintf(w, `{"id":%q,"state":%q,"stop_reason":%q,"started_at":%q,"finished_at":%q}`,
+						s.WorkID, state, reason, s.StartedAt.Format(time.RFC3339), clock.Now().Format(time.RFC3339))
+				case suffix == "/egress":
+					w.Header().Set("x-egress-dropped", "0")
+				case req.Method == http.MethodDelete:
+					w.WriteHeader(204)
+				default:
+					w.WriteHeader(404)
+					fmt.Fprint(w, `{"error":"not_found"}`)
+				}
+			})
+			r.factory = factory
+			err := r.collect(t.Context(), s, out)
+			if exitCode(err) != tc.code || !slices.Equal(factory.calls, tc.calls) {
+				t.Fatalf("worker collect = %v (exit %d), state calls = %v; want exit %d, calls %v",
+					err, exitCode(err), factory.calls, tc.code, tc.calls)
+			}
+			if tc.code == exitStateError {
+				if !strings.Contains(err.Error(), "storage unavailable") || slices.Contains(routes, "POST /stop") ||
+					slices.Contains(routes, "DELETE ") || factory.record == nil {
+					t.Fatalf("err = %v, routes = %v, record = %+v; want the start-of-collect failure behaviour",
+						err, routes, factory.record)
+				}
+				return
+			}
+			rec, readErr := readJSON[record.Record](filepath.Join(out, "record.partial.json"))
+			if readErr != nil || rec.StopReason != stopStopped || rec.Interruptions.Count != 1 ||
+				!slices.Equal(rec.Interruptions.Notes, []string{stoppedNote}) {
+				t.Fatalf("record = %+v, %v", rec, readErr)
+			}
+			if !stoppedAt.Equal(s.StartedAt.Add(30*time.Second)) || routes[len(routes)-1] != "DELETE " || factory.record != nil {
+				t.Fatalf("stopped at %s, routes = %v, record = %+v", stoppedAt, routes, factory.record)
+			}
+		})
+	}
+}
+
+func TestWorkerWaitNotesTransientStopCheckError(t *testing.T) {
+	clock := testClock()
+	s := sessionState(clock.Now())
+	s.Candidate, s.MinutesLimit = workerCandidate, 30
+	factory := &fakeFactory{stoppedErrs: []error{errors.New("storage unavailable")}}
+	r := workerTestRunner(t, clock, func(w http.ResponseWriter, req *http.Request) {
+		state := "running"
+		if clock.Now().Sub(s.StartedAt) >= 40*time.Second {
+			state = "lost"
+		}
+		fmt.Fprintf(w, `{"id":%q,"state":%q}`, s.WorkID, state)
+	})
+	r.factory = factory
+	status, interruptions, err := r.waitWorker(t.Context(), s)
+	if err != nil || status.State != "lost" || interruptions.Count != 0 ||
+		!slices.Equal(interruptions.Notes, []string{stopCheckFailedNote}) ||
+		!slices.Equal(factory.calls, []string{"Stopped", "Stopped"}) {
+		t.Fatalf("wait = %+v, %+v, %v; state calls = %v", status, interruptions, err, factory.calls)
 	}
 }
 

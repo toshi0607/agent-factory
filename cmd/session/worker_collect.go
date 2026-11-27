@@ -45,7 +45,7 @@ func (r runner) collectWorker(ctx context.Context, s state, out string, stopping
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return err
 	}
-	status, interruptions, err := r.waitWorkerOrStop(ctx, s, stopping)
+	status, interruptions, err := r.waitWorkerOrStop(ctx, s, &stopping)
 	if err != nil {
 		return err
 	}
@@ -183,12 +183,13 @@ func (r runner) collectWorker(ctx context.Context, s state, out string, stopping
 }
 
 func (r runner) waitWorker(ctx context.Context, s state) (cfsandbox.Status, record.Interruptions, error) {
-	return r.waitWorkerOrStop(ctx, s, false)
+	return r.waitWorkerOrStop(ctx, s, new(false))
 }
 
 // waitWorkerOrStop waits for the run to finish. With stopping set it asks
-// the Worker to cancel the run at once instead of at the time limit.
-func (r runner) waitWorkerOrStop(ctx context.Context, s state, stopping bool) (cfsandbox.Status, record.Interruptions, error) {
+// the Worker to cancel the run at once instead of at the time limit. It sets
+// stopping when a periodic check finds the stop flag set.
+func (r runner) waitWorkerOrStop(ctx context.Context, s state, stopping *bool) (cfsandbox.Status, record.Interruptions, error) {
 	interruptions := record.Interruptions{Notes: []string{}}
 	deadline := s.StartedAt.Add(time.Duration(s.MinutesLimit)*time.Minute + workerAlarmGrace)
 	lastToken := s.StartedAt
@@ -198,6 +199,7 @@ func (r runner) waitWorkerOrStop(ctx context.Context, s state, stopping bool) (c
 	var stopDeadline time.Time
 	var stopErr error
 	var consecutiveFailures int
+	var watch stopWatch
 	for {
 		status, err := r.worker.Status(ctx, s.WorkID)
 		if err != nil {
@@ -214,10 +216,21 @@ func (r runner) waitWorkerOrStop(ctx context.Context, s state, stopping bool) (c
 			return status, interruptions, errors.New("worker run is unavailable for collection")
 		}
 
+		if !*stopping && stopDeadline.IsZero() {
+			failedBefore := watch.failed
+			found, err := r.pollStop(ctx, &watch)
+			if watch.failed && !failedBefore {
+				interruptions.Notes = append(interruptions.Notes, stopCheckFailedNote)
+			}
+			if err != nil {
+				return status, interruptions, err
+			}
+			*stopping = found
+		}
 		now := r.clock.Now()
-		if stopDeadline.IsZero() && (stopping || !now.Before(deadline)) {
+		if stopDeadline.IsZero() && (*stopping || !now.Before(deadline)) {
 			reason := workerCancel
-			if !stopping {
+			if !*stopping {
 				if status.State != "running" {
 					return status, interruptions, errors.New("worker run did not start")
 				}

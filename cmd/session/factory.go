@@ -62,6 +62,49 @@ func (r runner) stopRequested(ctx context.Context) (bool, error) {
 	return flag != nil, nil
 }
 
+const (
+	stopCheckInterval    = 30 * time.Second
+	stopCheckMaxFailures = 3
+	stopCheckFailedNote  = "A factory stop flag check failed while waiting for the session."
+)
+
+// stopWatch throttles stop-flag checks while collect waits for a running
+// session.
+type stopWatch struct {
+	checked   bool
+	lastCheck time.Time
+	failures  int
+	failed    bool
+}
+
+// pollStop checks the stop flag on the first call and then at most once per
+// stopCheckInterval. Only stopCheckMaxFailures consecutive failed checks are
+// an error; that error is the one the start-of-collect check returns.
+func (r runner) pollStop(ctx context.Context, w *stopWatch) (bool, error) {
+	if r.factory == nil {
+		return false, nil
+	}
+	now := r.clock.Now()
+	if w.checked && now.Sub(w.lastCheck) < stopCheckInterval {
+		return false, nil
+	}
+	w.checked, w.lastCheck = true, now
+	stopped, err := r.stopRequested(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		w.failures++
+		w.failed = true
+		if w.failures >= stopCheckMaxFailures {
+			return false, err
+		}
+		return false, nil
+	}
+	w.failures = 0
+	return stopped, nil
+}
+
 func (r runner) checkNotStopped(ctx context.Context) error {
 	stopped, err := r.stopRequested(ctx)
 	if err == nil && stopped {
