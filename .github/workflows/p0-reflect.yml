@@ -1,3 +1,8 @@
+# Callers grant this workflow contents: write and id-token: write. The gate
+# job uses only the OIDC token, to read the factory stop flag; the reflect
+# job uses only contents: write. When gcp_wif_provider,
+# gcp_reflect_service_account, and state_bucket are all empty the gate skips
+# the check; setting only some of them fails the gate.
 name: P0 reflect
 
 on:
@@ -15,11 +20,87 @@ on:
       target_ref:
         type: string
         required: true
+      gcp_wif_provider:
+        type: string
+        default: ''
+      gcp_reflect_service_account:
+        type: string
+        default: ''
+      state_bucket:
+        type: string
+        default: ''
 
 permissions: {}
 
 jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Validate factory ref
+        shell: bash
+        env:
+          FACTORY_REF: ${{ inputs.factory_ref }}
+        run: |
+          if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'factory_ref must be a full lowercase commit SHA\n' >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: toshi0607/agent-factory
+          ref: ${{ inputs.factory_ref }}
+          path: factory
+          persist-credentials: false
+      - uses: actions/setup-go@v7.1.0
+        with:
+          go-version: '1.26.11'
+          check-latest: false
+          cache: false
+      - name: Build session CLI
+        working-directory: factory
+        env:
+          FACTORY_REF: ${{ inputs.factory_ref }}
+          CGO_ENABLED: '0'
+          GOTOOLCHAIN: local
+          GOFLAGS: -mod=readonly
+        run: |
+          factory_commit="$(git rev-parse HEAD)"
+          if [[ "$factory_commit" != "$FACTORY_REF" ]]; then
+            printf 'Factory checkout does not match factory_ref\n' >&2
+            exit 1
+          fi
+          printf 'FACTORY_COMMIT=%s\n' "$factory_commit" >> "$GITHUB_ENV"
+          mkdir "$RUNNER_TEMP/bin"
+          go build -o "$RUNNER_TEMP/bin/session" ./cmd/session
+      - name: Check the factory stop flag
+        shell: bash
+        env:
+          FACTORY_GCP_WIF_PROVIDER: ${{ inputs.gcp_wif_provider }}
+          FACTORY_GCP_SERVICE_ACCOUNT: ${{ inputs.gcp_reflect_service_account }}
+          FACTORY_STATE_BUCKET: ${{ inputs.state_bucket }}
+        run: |
+          configured=0
+          for value in "$FACTORY_GCP_WIF_PROVIDER" "$FACTORY_GCP_SERVICE_ACCOUNT" "$FACTORY_STATE_BUCKET"; do
+            if [[ -n "$value" ]]; then
+              configured=$((configured + 1))
+            fi
+          done
+          if (( configured == 0 )); then
+            printf '::notice::Factory state is not configured; the stop flag check was skipped.\n'
+            exit 0
+          fi
+          if (( configured != 3 )); then
+            printf 'Set gcp_wif_provider, gcp_reflect_service_account, and state_bucket together, or none of them\n' >&2
+            exit 1
+          fi
+          exec "$RUNNER_TEMP/bin/session" state check
+
   reflect:
+    needs: gate
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

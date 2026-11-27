@@ -36,6 +36,15 @@ on:
       minutes:
         type: string
         default: ''
+      gcp_wif_provider:
+        type: string
+        default: ''
+      gcp_work_service_account:
+        type: string
+        default: ''
+      state_bucket:
+        type: string
+        default: ''
     secrets:
       worker_url:
         required: false
@@ -184,6 +193,9 @@ jobs:
           ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
           ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ inputs.service_account_id }}
           ANTHROPIC_WORKSPACE_ID: ${{ inputs.workspace_id }}
+          FACTORY_GCP_WIF_PROVIDER: ${{ inputs.gcp_wif_provider }}
+          FACTORY_GCP_SERVICE_ACCOUNT: ${{ inputs.gcp_work_service_account }}
+          FACTORY_STATE_BUCKET: ${{ inputs.state_bucket }}
         run: |
           if [[ ! "$PREPARE_SECONDS" =~ ^[0-9]+$ ]]; then
             printf 'Invalid prepare runner time\n' >&2
@@ -220,6 +232,9 @@ jobs:
           ANTHROPIC_ORGANIZATION_ID: ${{ inputs.organization_id }}
           ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ inputs.service_account_id }}
           ANTHROPIC_WORKSPACE_ID: ${{ inputs.workspace_id }}
+          FACTORY_GCP_WIF_PROVIDER: ${{ inputs.gcp_wif_provider }}
+          FACTORY_GCP_SERVICE_ACCOUNT: ${{ inputs.gcp_work_service_account }}
+          FACTORY_STATE_BUCKET: ${{ inputs.state_bucket }}
         run: |
           if [[ -f "$RUNNER_TEMP/state.json" ]]; then
             exec "$RUNNER_TEMP/bin/session" cleanup -state "$RUNNER_TEMP/state.json"
@@ -294,6 +309,9 @@ jobs:
         id: collect
         env:
           FACTORY_WORKER_URL: ${{ secrets.worker_url }}
+          FACTORY_GCP_WIF_PROVIDER: ${{ inputs.gcp_wif_provider }}
+          FACTORY_GCP_SERVICE_ACCOUNT: ${{ inputs.gcp_work_service_account }}
+          FACTORY_STATE_BUCKET: ${{ inputs.state_bucket }}
         run: |
           exec "$RUNNER_TEMP/bin/session" collect -state "$P0_STATE_PATH" -out "$RUNNER_TEMP/out"
       - uses: actions/upload-artifact@v7.0.2
@@ -312,6 +330,9 @@ jobs:
         if: always() && steps.collect.outcome != 'success' && steps.collect.outcome != 'failure'
         env:
           FACTORY_WORKER_URL: ${{ secrets.worker_url }}
+          FACTORY_GCP_WIF_PROVIDER: ${{ inputs.gcp_wif_provider }}
+          FACTORY_GCP_SERVICE_ACCOUNT: ${{ inputs.gcp_work_service_account }}
+          FACTORY_STATE_BUCKET: ${{ inputs.state_bucket }}
         run: |
           if [[ ! -x "$RUNNER_TEMP/bin/session" || ! -f "${P0_STATE_PATH:-}" ]]; then
             printf '%s\n' "Session binary or state unavailable. Run the \"factory-p0-recover\" workflow with this run's id to clean up."

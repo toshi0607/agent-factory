@@ -133,7 +133,7 @@ func (r runner) startWorker(ctx context.Context, root *os.Root, manifest deliver
 	if err := writeJSON(statePath, s, delivery.WriteAtomic); err != nil {
 		return fmt.Errorf("update state file: %w", err)
 	}
-	return nil
+	return r.recordSession(ctx, s)
 }
 
 func (r runner) pushWorkerToken(ctx context.Context, id string) error {

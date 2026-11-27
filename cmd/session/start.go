@@ -30,6 +30,9 @@ func (r runner) start(ctx context.Context, policyPath, roleName, candidate, file
 	if candidate != "managed-agents" && candidate != workerCandidate {
 		return fmt.Errorf("unsupported candidate %q", candidate)
 	}
+	if err := r.checkNotStopped(ctx); err != nil {
+		return err
+	}
 	if candidate == workerCandidate {
 		client, err := r.workerClient()
 		if err != nil {
@@ -106,6 +109,14 @@ func (r runner) start(ctx context.Context, policyPath, roleName, candidate, file
 		}
 		return fmt.Errorf("create state file: %w", err)
 	}
+	// The state file comes first so that cleanup can end a record whose
+	// creation had an unknown outcome. A refusal leaves nothing to clean up.
+	if err := r.beginUnit(ctx, s); err != nil {
+		if exitCode(err) == exitInProgress {
+			err = errors.Join(err, removeOutput(statePath))
+		}
+		return err
+	}
 	defer func() {
 		if resultErr != nil {
 			resultErr = errors.Join(resultErr, r.cleanupAfterRun(ctx, s, "", false))
@@ -159,6 +170,9 @@ func (r runner) start(ctx context.Context, policyPath, roleName, candidate, file
 	s.SessionID = created.ID
 	if err := saveState(s.SessionID, err); err != nil {
 		return fmt.Errorf("create session: %w", err)
+	}
+	if err := r.recordSession(ctx, s); err != nil {
+		return err
 	}
 	message, err := userMessage(created.Resources, filesByName, roleName == "probe")
 	if err != nil {

@@ -59,6 +59,9 @@ jobs:
       organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
       service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
       workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+      gcp_wif_provider: ${{ vars.FACTORY_GCP_WIF_PROVIDER }}
+      gcp_work_service_account: ${{ vars.FACTORY_GCP_WORK_SERVICE_ACCOUNT }}
+      state_bucket: ${{ vars.FACTORY_STATE_BUCKET }}
     secrets:
       worker_url: ${{ secrets.FACTORY_WORKER_URL }}
 
@@ -67,6 +70,7 @@ jobs:
     if: ${{ inputs.reflect_to != '' && inputs.role == 'fixer' && inputs.candidate == 'managed-agents' }}
     permissions:
       contents: write
+      id-token: write
     # Replace both FACTORY_SHA placeholders with the same factory commit SHA.
     uses: toshi0607/agent-factory/.github/workflows/p0-reflect.yml@FACTORY_SHA
     with:
@@ -74,3 +78,6 @@ jobs:
       task: ${{ inputs.task }}
       role: ${{ inputs.role }}
       target_ref: ${{ inputs.reflect_to }}
+      gcp_wif_provider: ${{ vars.FACTORY_GCP_WIF_PROVIDER }}
+      gcp_reflect_service_account: ${{ vars.FACTORY_GCP_REFLECT_SERVICE_ACCOUNT }}
+      state_bucket: ${{ vars.FACTORY_STATE_BUCKET }}

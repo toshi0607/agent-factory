@@ -40,5 +40,8 @@ jobs:
       organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
       service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
       workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+      gcp_wif_provider: ${{ vars.FACTORY_GCP_WIF_PROVIDER }}
+      gcp_work_service_account: ${{ vars.FACTORY_GCP_WORK_SERVICE_ACCOUNT }}
+      state_bucket: ${{ vars.FACTORY_STATE_BUCKET }}
     secrets:
       worker_url: ${{ secrets.FACTORY_WORKER_URL }}

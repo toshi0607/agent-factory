@@ -32,7 +32,7 @@ const (
 	workerEgressName   = "egress.jsonl"
 )
 
-func (r runner) collectWorker(ctx context.Context, s state, out string) error {
+func (r runner) collectWorker(ctx context.Context, s state, out string, stopping bool) error {
 	start := r.clock.Now()
 	client, err := r.workerClient()
 	if err != nil {
@@ -45,7 +45,7 @@ func (r runner) collectWorker(ctx context.Context, s state, out string) error {
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return err
 	}
-	status, interruptions, err := r.waitWorker(ctx, s)
+	status, interruptions, err := r.waitWorkerOrStop(ctx, s, stopping)
 	if err != nil {
 		return err
 	}
@@ -140,11 +140,17 @@ func (r runner) collectWorker(ctx context.Context, s state, out string) error {
 		interruptions.Count++
 		interruptions.Notes = append(interruptions.Notes, "Worker lost the run.")
 	}
+	stopReason := status.StopReason
+	if stopping {
+		stopReason = stopStopped
+		interruptions.Count++
+		interruptions.Notes = append(interruptions.Notes, stoppedNote)
+	}
 	rec := record.Record{
 		SchemaVersion: 1, Candidate: s.Candidate, Task: s.Task, WorkID: s.WorkID,
 		BaseCommit: s.BaseCommit, FactoryCommit: s.FactoryCommit, Role: s.Role, Model: s.Model,
 		EnvironmentRequestSHA256: s.EnvironmentRequestSHA256, AgentRequestSHA256: s.AgentRequestSHA256,
-		BudgetCents: s.BudgetCents, MinutesLimit: s.MinutesLimit, StopReason: status.StopReason,
+		BudgetCents: s.BudgetCents, MinutesLimit: s.MinutesLimit, StopReason: stopReason,
 		StartedAt: status.StartedAt, FinishedAt: status.FinishedAt,
 		Session: record.Session{ID: s.WorkID, Status: status.State, DurationSeconds: duration, ActiveSeconds: duration},
 		Usage: record.Usage{
@@ -167,6 +173,9 @@ func (r runner) collectWorker(ctx context.Context, s state, out string) error {
 	if err := writeJSON(filepath.Join(out, "record.partial.json"), rec, delivery.WriteAtomic); err != nil {
 		return err
 	}
+	if stopping {
+		return errors.Join(errFactoryStopped, r.cleanup(ctx, s, "", false))
+	}
 	if requiredErr != nil {
 		return requiredErr
 	}
@@ -174,6 +183,12 @@ func (r runner) collectWorker(ctx context.Context, s state, out string) error {
 }
 
 func (r runner) waitWorker(ctx context.Context, s state) (cfsandbox.Status, record.Interruptions, error) {
+	return r.waitWorkerOrStop(ctx, s, false)
+}
+
+// waitWorkerOrStop waits for the run to finish. With stopping set it asks
+// the Worker to cancel the run at once instead of at the time limit.
+func (r runner) waitWorkerOrStop(ctx context.Context, s state, stopping bool) (cfsandbox.Status, record.Interruptions, error) {
 	interruptions := record.Interruptions{Notes: []string{}}
 	deadline := s.StartedAt.Add(time.Duration(s.MinutesLimit)*time.Minute + workerAlarmGrace)
 	lastToken := s.StartedAt
@@ -200,15 +215,19 @@ func (r runner) waitWorker(ctx context.Context, s state) (cfsandbox.Status, reco
 		}
 
 		now := r.clock.Now()
-		if stopDeadline.IsZero() && !now.Before(deadline) {
-			if status.State != "running" {
-				return status, interruptions, errors.New("worker run did not start")
+		if stopDeadline.IsZero() && (stopping || !now.Before(deadline)) {
+			reason := workerCancel
+			if !stopping {
+				if status.State != "running" {
+					return status, interruptions, errors.New("worker run did not start")
+				}
+				reason = stopTimeLimit
 			}
 			stopDeadline = now.Add(workerStopGrace)
 			stopCtx, cancel := context.WithTimeout(ctx, workerStopGrace)
 			defer cancel()
 			ctx = stopCtx
-			stopErr = r.worker.Stop(ctx, s.WorkID, stopTimeLimit)
+			stopErr = r.worker.Stop(ctx, s.WorkID, reason)
 			continue
 		}
 		if !stopDeadline.IsZero() && !now.Before(stopDeadline) {

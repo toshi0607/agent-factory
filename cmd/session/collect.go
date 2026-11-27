@@ -40,8 +40,12 @@ func validMinutes(minutes int) bool {
 const recoveryHint = `run the "factory-p0-recover" workflow with this run's id to collect again or clean up`
 
 func (r runner) collect(ctx context.Context, s state, out string) (resultErr error) {
+	stopping, stopCheckErr := r.stopRequested(ctx)
 	if s.Candidate == workerCandidate {
-		return r.collectWorker(ctx, s, out)
+		if stopCheckErr != nil {
+			return stopCheckErr
+		}
+		return r.collectWorker(ctx, s, out, stopping)
 	}
 	start := r.clock.Now()
 	var session claude.Session
@@ -57,19 +61,31 @@ func (r runner) collect(ctx context.Context, s state, out string) (resultErr err
 	if s.SessionID == "" || !validMinutes(s.MinutesLimit) || s.StartedAt.IsZero() {
 		return errors.New("state requires a session ID, positive minutes limit, and start time")
 	}
+	// A failed stop-flag check goes through the failure path, which stops the session.
+	if stopCheckErr != nil {
+		return stopCheckErr
+	}
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return err
 	}
 
-	deadline := s.StartedAt.Add(time.Duration(s.MinutesLimit) * time.Minute)
-	session, stopReason, resultErr = r.waitForCompletion(ctx, s.SessionID, s.StartedAt, deadline)
-	if resultErr != nil {
-		return resultErr
+	if stopping {
+		stopReason = stopStopped
+	} else {
+		deadline := s.StartedAt.Add(time.Duration(s.MinutesLimit) * time.Minute)
+		session, stopReason, resultErr = r.waitForCompletion(ctx, s.SessionID, s.StartedAt, deadline)
+		if resultErr != nil {
+			return resultErr
+		}
 	}
-	if stopReason == stopTimeLimit {
+	interrupted := stopReason == stopTimeLimit || stopReason == stopStopped
+	if interrupted {
 		session, resultErr = r.interruptAndWait(ctx, s.SessionID)
 		if resultErr != nil {
 			stopAttempted = true
+			if stopping {
+				return fmt.Errorf("stop session for the factory stop flag: %w", resultErr)
+			}
 			return fmt.Errorf("stop session at time limit: %w", resultErr)
 		}
 	}
@@ -139,12 +155,17 @@ func (r runner) collect(ctx context.Context, s state, out string) (resultErr err
 	}
 	if stopReason == stopTimeLimit {
 		rec.Interruptions = record.Interruptions{Count: 1, Notes: []string{"Session time limit reached."}}
+	} else if stopping {
+		rec.Interruptions = record.Interruptions{Count: 1, Notes: []string{stoppedNote}}
 	}
 	if err := writeJSON(filepath.Join(out, "record.partial.json"), rec, delivery.WriteAtomic); err != nil {
 		return err
 	}
 	recordSaved = true
-	cleanupErr := r.cleanupAfterRun(ctx, s, session.Status, stopReason == stopTimeLimit)
+	cleanupErr := r.cleanupAfterRun(ctx, s, session.Status, interrupted)
+	if stopping {
+		cleanupErr = errors.Join(errFactoryStopped, cleanupErr)
+	}
 	if webToolsUsed {
 		return errors.Join(errors.New(webToolViolation), cleanupErr)
 	}

@@ -15,7 +15,13 @@ func (r runner) cleanupAfterRun(ctx context.Context, s state, status string, int
 	return r.cleanup(ctx, s, status, interrupted)
 }
 
+// cleanup removes the unit's resources and then, as a best effort, its
+// in-progress record.
 func (r runner) cleanup(ctx context.Context, s state, status string, interrupted bool) error {
+	return errors.Join(r.cleanupResources(ctx, s, status, interrupted), r.endUnit(ctx, s.WorkID))
+}
+
+func (r runner) cleanupResources(ctx context.Context, s state, status string, interrupted bool) error {
 	if s.Candidate == workerCandidate {
 		client, err := r.workerClient()
 		if err != nil {

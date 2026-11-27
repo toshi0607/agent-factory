@@ -110,8 +110,10 @@ if not isinstance(workflow, dict):
     fail(workflow_file, "define the workflow as a mapping")
 if workflow_file == reflect_file:
     jobs = workflow.get("jobs")
-    if not isinstance(jobs, dict) or set(jobs) != {"reflect"}:
-        fail(workflow_file, "define exactly one job named reflect")
+    if not isinstance(jobs, dict) or set(jobs) != {"gate", "reflect"}:
+        fail(workflow_file, "define exactly the jobs gate and reflect")
+    if jobs["reflect"].get("needs") not in ("gate", ["gate"]):
+        fail(workflow_file, "make the reflect job need the gate job")
     pushes = [step for step in jobs["reflect"].get("steps", []) if step.get("id") == "push"]
     auth = pushes[0].get("env", {}).get("GITHUB_TOKEN") if len(pushes) == 1 else None
     token = re.compile(r"""\b(?:github\s*(?:\.\s*token\b|\[\s*['"]token['"]\s*\])|secrets\s*(?:\.\s*github_token\b|\[\s*['"]github_token['"]\s*\]))""", re.I)
@@ -144,7 +146,9 @@ for name, job in workflow["jobs"].items():
     recovery_permissions = permissions == {"id-token": "write", "contents": "read", "actions": "read"}
     emit("job", name, str(int(oidc)), str(int(permissions == {})),
          str(int(permissions == {"contents": "read"})), str(int(actions)), str(int(recovery_permissions)),
-         str(int(contents_write)), str(int(permissions == {"contents": "write"})), job.get("uses", ""))
+         str(int(contents_write)), str(int(permissions == {"contents": "write"})),
+         str(int(permissions == {"id-token": "write", "contents": "read"})),
+         str(int(permissions == {"id-token": "write", "contents": "write"})), job.get("uses", ""))
     if references is not None and job.get("uses") in references:
         uses = job["uses"]
         if not is_locked(uses):
@@ -291,8 +295,11 @@ end
 abort "#{workflow_file}: define the workflow as a mapping" unless workflow.is_a?(Hash)
 if workflow_file == reflect_file
   jobs = workflow["jobs"]
-  unless jobs.is_a?(Hash) && jobs.keys == ["reflect"]
-    abort "#{workflow_file}: define exactly one job named reflect"
+  unless jobs.is_a?(Hash) && jobs.keys.sort == ["gate", "reflect"]
+    abort "#{workflow_file}: define exactly the jobs gate and reflect"
+  end
+  unless ["gate", ["gate"]].include?(jobs["reflect"]["needs"])
+    abort "#{workflow_file}: make the reflect job need the gate job"
   end
   pushes = jobs["reflect"].fetch("steps", []).select { |step| step["id"] == "push" }
   auth = pushes.first.dig("env", "GITHUB_TOKEN") if pushes.size == 1
@@ -335,7 +342,9 @@ workflow.fetch("jobs").each do |name, job|
   emit("job", name, oidc ? "1" : "0", permissions == {} ? "1" : "0",
        permissions == {"contents" => "read"} ? "1" : "0", actions ? "1" : "0",
        recovery_permissions ? "1" : "0", contents_write ? "1" : "0",
-       permissions == {"contents" => "write"} ? "1" : "0", job.fetch("uses", ""))
+       permissions == {"contents" => "write"} ? "1" : "0",
+       permissions == {"id-token" => "write", "contents" => "read"} ? "1" : "0",
+       permissions == {"id-token" => "write", "contents" => "write"} ? "1" : "0", job.fetch("uses", ""))
   if references && references.include?(job["uses"])
     uses = job["uses"]
     unless locked?(uses, references, dependencies)
@@ -477,7 +486,7 @@ validate_session_invocations() {
 
 validate_workflow() {
   local record name= oidc empty contents_read actions recovery_permissions uses locked persist repository factory pinned_go
-  local contents_write contents_write_only
+  local contents_write contents_write_only oidc_contents_read oidc_contents_write
   local factory_ref ref_guard checked_ref step_number script run_line directory artifact_path
   local downloads= outputs= commands output match
   local verify_job=0 verify_checkout=0 verify_runs=0
@@ -499,6 +508,8 @@ validate_workflow() {
         IFS= read -r -d '' recovery_permissions
         IFS= read -r -d '' contents_write
         IFS= read -r -d '' contents_write_only
+        IFS= read -r -d '' oidc_contents_read
+        IFS= read -r -d '' oidc_contents_write
         IFS= read -r -d '' uses
         [[ ${uses%%@*} != *[[:upper:]]* ]] || fail "use a lowercase reusable workflow name in job $name"
         if [[ $file == "$verify_lockfile" ]]; then
@@ -506,8 +517,14 @@ validate_workflow() {
           verify_job=1
           [[ $contents_read == 1 ]] || fail "set permissions for job $name to contents: read"
         fi
-        if [[ $file == "$reflect_workflow" || ( $file == poc/caller/factory-p0.yml && $name == reflect ) ]]; then
+        if [[ $file == "$reflect_workflow" && $name == gate ]]; then
+          # The gate reads the stop flag with OIDC; it must not be able to write the repository.
+          [[ $oidc_contents_read == 1 ]] || fail "set permissions for job $name to id-token: write and contents: read only"
+        elif [[ $file == "$reflect_workflow" ]]; then
           [[ $contents_write_only == 1 ]] || fail "set permissions for job $name to contents: write only"
+        elif [[ $file == poc/caller/factory-p0.yml && $name == reflect ]]; then
+          # A called workflow cannot exceed the caller's grant, and the gate job needs id-token.
+          [[ $oidc_contents_write == 1 ]] || fail "set permissions for job $name to contents: write and id-token: write only"
         elif [[ $contents_write == 1 ]]; then
           fail "grant contents: write only to the reflect workflow and its caller"
         fi

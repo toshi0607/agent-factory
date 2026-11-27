@@ -18,6 +18,7 @@ import (
 	"github.com/toshi0607/agent-factory/internal/claude"
 	"github.com/toshi0607/agent-factory/internal/claudeauth"
 	"github.com/toshi0607/agent-factory/internal/delivery"
+	"github.com/toshi0607/agent-factory/internal/factorystate"
 )
 
 type clock interface {
@@ -44,6 +45,7 @@ type runner struct {
 	api          *claude.Client
 	auth         *claudeauth.Federation
 	worker       *cfsandbox.Client
+	factory      factoryState
 	clock        clock
 	pollInterval time.Duration
 	stdout       io.Writer
@@ -81,15 +83,23 @@ func main() {
 		api: claude.New(claude.DefaultBaseURL, http.DefaultClient, auth), auth: auth,
 		clock: wallClock{}, pollInterval: 10 * time.Second, stdout: os.Stdout,
 	}
+	store, err := factorystate.FromEnv(http.DefaultClient)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "session:", err)
+		os.Exit(exitStateError)
+	}
+	if store != nil {
+		r.factory = store
+	}
 	if err := r.run(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "session:", err)
-		os.Exit(1)
+		os.Exit(exitCode(err))
 	}
 }
 
 func (r runner) run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: session <auth-check|oidc-claims|start|collect|cleanup|merge>")
+		return errors.New("usage: session <auth-check|oidc-claims|start|collect|cleanup|merge|state>")
 	}
 	command, args := args[0], args[1:]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -209,6 +219,8 @@ func (r runner) run(ctx context.Context, args []string) error {
 			return err
 		}
 		return merge(*partial, *check, *start, *checkTime, *out)
+	case "state":
+		return r.stateCommand(ctx, args)
 	default:
 		return fmt.Errorf("unknown subcommand %q", command)
 	}
