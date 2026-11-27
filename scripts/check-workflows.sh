@@ -412,6 +412,13 @@ if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 BASH
 )
+reflect_push_guard=$(cat <<'BASH'
+credential="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w 0)"
+printf '::add-mask::%s\n' "$credential"
+GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $credential"
+printf '::add-mask::%s\n' "$GIT_CONFIG_VALUE_0"
+BASH
+)
 
 workflow_path() {
   local value=$1 directory=$2 part result=
@@ -540,6 +547,9 @@ validate_workflow() {
         ((++step_number))
         if [[ $file == .github/workflows/* && $run_line != 0 ]]; then
           validate_session_invocations "$script" "$run_line"
+        fi
+        if [[ $file == "$reflect_workflow" && $script == *'exec "$RUNNER_TEMP/bin/reflect" push '* ]]; then
+          [[ $script == "$reflect_push_guard"$'\n'* ]] || fail 'mask the base64 credential and full header before using either in reflect push'
         fi
         if [[ $step_number == 1 && $ref_guard == 1 ]]; then
           if [[ ${script%$'\n'} == "$factory_ref_guard" ]]; then

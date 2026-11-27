@@ -15,6 +15,8 @@ const githubAuthKey = "http.https://github.com/.extraheader"
 var (
 	githubRepository = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 	gitSecrets       = regexp.MustCompile(`(?i)AUTHORIZATION:[^\r\n]*|x-access-token:[^@\s]*|[A-Za-z0-9+/_-]{41,}={0,2}`)
+	// Only push_test.go enables the local transport.
+	allowLocalRemoteForTest bool
 )
 
 type pushResult struct {
@@ -33,8 +35,7 @@ func push(opt options) *failure {
 		return reject("target ref is not allowed")
 	}
 	protocol := "https"
-	// Absolute local paths are for tests only. The workflow uses HTTPS.
-	if filepath.IsAbs(opt.remote) && !strings.ContainsRune(opt.remote, 0) {
+	if allowLocalRemoteForTest && filepath.IsAbs(opt.remote) && !strings.ContainsRune(opt.remote, 0) {
 		protocol = "file"
 	} else if !githubRepository.MatchString(p.Product.Repository) ||
 		opt.remote != "https://github.com/"+p.Product.Repository+".git" {
@@ -68,17 +69,28 @@ func push(opt options) *failure {
 	env := append(repo.gitEnv(), "GIT_ALLOW_PROTOCOL="+protocol, "GIT_ASKPASS=/bin/false")
 	// The private repository requires the same header for discovery and push.
 	if protocol == "https" {
-		if count, key := os.Getenv("GIT_CONFIG_COUNT"), os.Getenv("GIT_CONFIG_KEY_0"); count != "" || key != "" {
-			if count != "1" || key != githubAuthKey {
-				return failed("invalid Git authentication configuration")
-			}
-			env = append(env, "GIT_CONFIG_COUNT="+count, "GIT_CONFIG_KEY_0="+key,
-				"GIT_CONFIG_VALUE_0="+os.Getenv("GIT_CONFIG_VALUE_0"))
+		auth, problem := githubAuthEnv(os.Environ())
+		if problem != nil {
+			return problem
 		}
+		env = append(env, auth...)
 	}
 	remoteGit := func(args ...string) ([]byte, error) {
 		config := []string{"-c", "credential.helper=", "-c", "http.followRedirects=false"}
 		return patchcheck.GitWithEnv(repo.scratch, nil, env, append(config, args...)...)
+	}
+	head, err := remoteGit("ls-remote", "--symref", "--", opt.remote, "HEAD")
+	if err != nil {
+		return remoteFailure("cannot read remote default branch", err)
+	}
+	if !p.Reflect.DefaultBranchAllowed {
+		defaultRef := remoteDefaultBranch(string(head))
+		switch defaultRef {
+		case "":
+			return failed("cannot determine remote default branch")
+		case opt.targetRef:
+			return reject("target ref is the default branch")
+		}
 	}
 	refs, err := remoteGit("ls-remote", "--refs", "--", opt.remote, opt.targetRef)
 	if err != nil {
@@ -123,6 +135,43 @@ func push(opt options) *failure {
 		return failed("pushed reflected commit but cannot write push result")
 	}
 	return nil
+}
+
+func githubAuthEnv(env []string) ([]string, *failure) {
+	var auth []string
+	seen := make(map[string]bool, 3)
+	for _, entry := range env {
+		key, value, _ := strings.Cut(entry, "=")
+		if key != "GIT_CONFIG" && !strings.HasPrefix(key, "GIT_CONFIG_") {
+			continue
+		}
+		if seen[key] {
+			return nil, failed("invalid Git authentication configuration")
+		}
+		seen[key] = true
+		switch {
+		case key == "GIT_CONFIG_COUNT" && value == "1",
+			key == "GIT_CONFIG_KEY_0" && value == githubAuthKey,
+			key == "GIT_CONFIG_VALUE_0" && value != "":
+			auth = append(auth, entry)
+		default:
+			return nil, failed("invalid Git authentication configuration")
+		}
+	}
+	if len(auth) != 0 && len(auth) != 3 {
+		return nil, failed("invalid Git authentication configuration")
+	}
+	return auth, nil
+}
+
+func remoteDefaultBranch(output string) string {
+	for line := range strings.SplitSeq(output, "\n") {
+		target, ref, _ := strings.Cut(line, "\t")
+		if branch, ok := strings.CutPrefix(target, "ref: refs/heads/"); ok && branch != "" && ref == "HEAD" {
+			return "refs/heads/" + branch
+		}
+	}
+	return ""
 }
 
 func (r *repository) checkPushCommit(result commitResult) *failure {

@@ -8,10 +8,12 @@ import (
 )
 
 type Reflect struct {
-	TargetRefs      []string `yaml:"target_refs"`
-	Generated       []string `yaml:"generated"`
-	DependencyFiles []string `yaml:"dependency_files"`
-	Protected       []string `yaml:"protected"`
+	TargetRefs           []string `yaml:"target_refs"`
+	DefaultBranchAllowed bool     `yaml:"default_branch_allowed"`
+	Generated            []string `yaml:"generated"`
+	GeneratedOutputs     []string `yaml:"generated_outputs"`
+	DependencyFiles      []string `yaml:"dependency_files"`
+	Protected            []string `yaml:"protected"`
 }
 
 const builtInProtected = ".github/** AGENTS.md **/AGENTS.md CLAUDE.md **/CLAUDE.md .claude/** **/.claude/** .codex/** **/.codex/** .git/** .gitmodules .gitattributes **/.gitattributes"
@@ -22,6 +24,10 @@ func (p Policy) RoleMayWrite(role, path string) bool {
 
 func (p Policy) Generated(path string) bool {
 	return matchesAny(p.Reflect.Generated, path)
+}
+
+func (p Policy) GeneratedOutput(path string) bool {
+	return matchesAny(p.Reflect.GeneratedOutputs, path)
 }
 
 func (p Policy) Protected(path string) bool {
@@ -38,7 +44,7 @@ func (p Policy) DependencyFile(path string) bool {
 }
 
 func (p Policy) TargetRefAllowed(ref string) bool {
-	return slices.Contains(p.Reflect.TargetRefs, ref)
+	return validTargetRef(ref) && slices.Contains(p.Reflect.TargetRefs, ref)
 }
 
 func (p Policy) validateReflect() error {
@@ -52,12 +58,16 @@ func (p Policy) validateReflect() error {
 		patterns []string
 	}{
 		{"reflect.generated", p.Reflect.Generated},
+		{"reflect.generated_outputs", p.Reflect.GeneratedOutputs},
 		{"reflect.dependency_files", p.Reflect.DependencyFiles},
 		{"reflect.protected", p.Reflect.Protected},
 	} {
 		if err := validatePatterns(field.name, field.patterns); err != nil {
 			return err
 		}
+	}
+	if len(p.Reflect.Generated) != 0 && len(p.Reflect.GeneratedOutputs) == 0 {
+		return errors.New("reflect.generated_outputs is required when reflect.generated is non-empty")
 	}
 	for name, role := range p.Roles {
 		if err := validatePatterns(fmt.Sprintf("role %q write", name), role.Write); err != nil {
@@ -71,7 +81,7 @@ func (p Policy) validateReflect() error {
 }
 
 func validTargetRef(ref string) bool {
-	if !strings.HasPrefix(ref, "refs/") || strings.HasSuffix(ref, ".") ||
+	if !strings.HasPrefix(ref, "refs/heads/") || strings.HasSuffix(ref, ".") ||
 		strings.Contains(ref, "..") || strings.Contains(ref, "@{") ||
 		strings.ContainsAny(ref, " ~^:?*[\\") {
 		return false

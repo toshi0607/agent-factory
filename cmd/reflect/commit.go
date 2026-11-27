@@ -73,7 +73,7 @@ func commit(opt options) *failure {
 		return reject("unknown decision P0 task")
 	}
 	wantTree := d.TreeSHA
-	clone, problem := repo.inspect(p, task, patches, opt.allowDependencies, &d)
+	clone, problem := repo.inspect(p, task, patches, &d)
 	if problem != nil {
 		return problem
 	}

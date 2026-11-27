@@ -13,9 +13,9 @@ out=$4
 if [[ $p0check != /* ]]; then
     p0check="$PWD/$p0check"
 fi
-mkdir -p -- "$out"
-out=$(cd -- "$out" && pwd -P)
-cd -- "$tree"
+mkdir -p -- "$out" || exit 14
+out=$(cd -- "$out" && pwd -P) || exit 14
+cd -- "$tree" || exit 14
 
 # Permit the caller's local file proxy, or use the existing module cache only.
 case ${GOPROXY:-off} in
@@ -24,23 +24,6 @@ case ${GOPROXY:-off} in
     *) export GOPROXY=off ;;
 esac
 export GOTOOLCHAIN=local GONOPROXY=none GOSUMDB=off
-
-if ! make gen-only >"$out/gen.log" 2>&1; then
-    exit 10
-fi
-
-if ! {
-    git status --porcelain=v1 -z --untracked-files=all --no-renames |
-        while IFS= read -r -d '' entry; do
-            printf '%s\n' "${entry:3}"
-        done | LC_ALL=C sort >"$out/gen-changed-paths.txt" &&
-        git -c core.hooksPath=/dev/null -c core.fsmonitor=false add -A &&
-        git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-            diff --cached --binary --no-ext-diff --no-textconv --no-renames HEAD >"$out/gen.diff" &&
-        git -c core.hooksPath=/dev/null -c core.fsmonitor=false write-tree >"$out/judged-tree.txt"
-} 2>"$out/gen-status.log"; then
-    exit 14
-fi
 
 if ! go build -buildvcs=false -o "$out/emulator" ./cmd/google-cloud-emulator >"$out/build.log" 2>&1; then
     exit 11

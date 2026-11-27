@@ -7,30 +7,40 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-
-	"github.com/toshi0607/agent-factory/poc/record"
 )
 
 func TestDockerArgs(t *testing.T) {
 	opt := options{taskID: "sm-create-get", image: "image@sha256:fake", modcache: "/module cache", work: "/work",
-		p0check: "/factory/bin/p0check", script: "/factory/scripts/p0-check-tree.sh"}
-	want := []string{
+		p0check: "/factory/bin/p0check", script: "/factory/scripts/p0-check-tree.sh", genScript: "/factory/scripts/p0-gen-tree.sh"}
+	common := []string{
 		"run", "--rm", "--network", "none", "--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges", "--pids-limit", "1024", "--memory", "4g",
 		"--user", "123:456", "--tmpfs", "/tmp:rw,exec,size=512m",
 		"-e", "HOME=/tmp", "-e", "GOCACHE=/gocache", "-e", "GOMODCACHE=/modcache",
 		"-e", "GOFLAGS=-mod=readonly", "-e", "GOPROXY=off", "-e", "GOTOOLCHAIN=local",
-		"-v", "/work/tree:/tree", "-v", "/work/out:/out", "-v", "/module cache:/modcache",
-		"-v", "/work/gocache:/gocache",
-		"-v", "/factory/bin/p0check:/p0check:ro", "-v", "/factory/scripts/p0-check-tree.sh:/p0-check-tree.sh:ro",
-		"-w", "/tree", "image@sha256:fake", "bash", "/p0-check-tree.sh", "/tree", "sm-create-get", "/p0check", "/out",
 	}
-	if got := dockerArgs(opt, "/work/tree", "/work/out", 123, 456); !slices.Equal(got, want) {
-		t.Fatalf("docker arguments\ngot  %q\nwant %q", got, want)
+	wantCheck := append(slices.Clone(common),
+		"-v", "/work/out:/out", "-v", "/work/gocache:/gocache", "-w", "/tree",
+		"-v", "/work/tree:/tree:ro", "-v", "/module cache:/modcache",
+		"-v", "/factory/bin/p0check:/p0check:ro", "-v", "/factory/scripts/p0-check-tree.sh:/p0-check-tree.sh:ro",
+		"image@sha256:fake", "bash", "/p0-check-tree.sh", "/tree", "sm-create-get", "/p0check", "/out",
+	)
+	if got := dockerArgs(opt, false, "/work/tree", "/work/out", 123, 456); !slices.Equal(got, wantCheck) {
+		t.Fatalf("check Docker arguments\ngot  %q\nwant %q", got, wantCheck)
+	}
+	wantGen := append(common,
+		"-v", "/work/gen-out:/out", "-v", "/work/gen-gocache:/gocache", "-w", "/tree",
+		"-v", "/work/tree:/tree", "-v", "/module cache:/modcache:ro",
+		"-v", "/factory/scripts/p0-gen-tree.sh:/p0-gen-tree.sh:ro",
+		"image@sha256:fake", "bash", "/p0-gen-tree.sh", "/tree", "/out",
+	)
+	if got := dockerArgs(opt, true, "/work/tree", "/work/gen-out", 123, 456); !slices.Equal(got, wantGen) {
+		t.Fatalf("generation Docker arguments\ngot  %q\nwant %q", got, wantGen)
 	}
 }
 
@@ -47,25 +57,23 @@ func TestCheckProductArchive(t *testing.T) {
 	runGit("init", "--template=")
 	writeTestFile(t, filepath.Join(repo, ".gitignore"), "ignored\n", 0o644)
 	writeTestFile(t, filepath.Join(repo, "ignored"), "git archive kept this file\n", 0o755)
-	if err := os.Symlink("ignored", filepath.Join(repo, "link")); err != nil {
-		t.Fatal(err)
-	}
 	runGit("add", "-f", "-A", "--")
 	runGit("-c", gitName, "-c", gitEmail, "commit", "--no-gpg-sign", "-m", "Original baseline")
 	archive := filepath.Join(dir, "product.tar.gz")
 	runGit("archive", "--format=tar.gz", "-o", archive, "HEAD")
 
 	work := filepath.Join(dir, "work")
+	genScript := filepath.Join(dir, "gen.sh")
+	writeTestFile(t, genScript, `set -eu
+[[ -x "$1/ignored" && ! -e "$1/.git" ]]
+touch "$2/generated"
+`, 0o644)
 	script := filepath.Join(dir, "check.sh")
 	writeTestFile(t, script, `set -eu
-[[ -x "$1/ignored" && -L "$1/link" ]]
-[[ $(git -C "$1" log -1 --format='%an <%ae>') == "checkpatch <checkpatch@invalid>" ]]
-[[ $(git -C "$1" rev-list --count HEAD) == 1 ]]
-touch "$4/gen-changed-paths.txt" "$4/gen.diff"
-git -C "$1" write-tree > "$4/judged-tree.txt"
+[[ -x "$1/ignored" && ! -e "$1/.git" && ! -e "$4/generated" ]]
 printf '{"task":"%s","passed":true,"failures":[]}\n' "$2" > "$4/p0check.json"
 `, 0o644)
-	args := []string{"-product-archive", archive, "-task", "sm-create-get", "-p0check", "fake", "-work", work, "-script", script, "-runner", "direct"}
+	args := []string{"-product-archive", archive, "-task", "sm-create-get", "-p0check", "fake", "-work", work, "-gen-script", genScript, "-script", script, "-runner", "direct"}
 	out, code := run(append(slices.Clone(args), "-patch", filepath.Join(dir, "missing.diff")), io.Discard)
 	if code != 2 || !strings.Contains(out.Error, "read patch") {
 		t.Fatalf("missing patch: exit %d, result %+v", code, out)
@@ -80,100 +88,254 @@ printf '{"task":"%s","passed":true,"failures":[]}\n' "$2" > "$4/p0check.json"
 	if _, err := os.Stat(filepath.Join(work, "base", ".git")); err != nil {
 		t.Fatal(err)
 	}
+	base := filepath.Join(work, "base")
+	if got := string(testGit(t, base, "log", "-1", "--format=%an <%ae>")); got != "checkpatch <checkpatch@invalid>\n" {
+		t.Fatalf("archive baseline author = %q", got)
+	}
+	if got := string(testGit(t, base, "rev-list", "--count", "HEAD")); got != "1\n" {
+		t.Fatalf("archive baseline commit count = %q", got)
+	}
+}
+
+func TestCheckTreeScriptsDirect(t *testing.T) {
+	product, bin := t.TempDir(), t.TempDir()
+	testGit(t, product, "init", "--template=")
+	writeTestFile(t, filepath.Join(product, "Makefile"), `gen-only:
+	test ! -e .git
+	test "$$GOPROXY" = off && test "$$GOTOOLCHAIN" = local && test "$$GOSUMDB" = off
+	echo generated > output.gen.go
+	test "$$TEST_GEN_FAIL" != yes
+`, 0o644)
+	testGit(t, product, "add", "-A", "--")
+	testGit(t, product, "-c", gitName, "-c", gitEmail, "commit", "--no-gpg-sign", "-m", "Product")
+	writeTestFile(t, filepath.Join(bin, "go"), `#!/bin/bash
+set -eu
+[[ $1 == build && $2 == -buildvcs=false && $3 == -o && $5 == ./cmd/google-cloud-emulator ]]
+[[ ! -e .git && $(cat output.gen.go) == generated ]]
+cat > "$4" <<'EMULATOR'
+#!/bin/bash
+printf '%s\n' 'google-cloud-emulator listening on 127.0.0.1:12345'
+exec sleep 30
+EMULATOR
+chmod +x "$4"
+`, 0o755)
+	p0check := filepath.Join(bin, "p0check")
+	writeTestFile(t, p0check, `#!/bin/bash
+set -eu
+[[ $1 == -task && $2 == sm-create-get && $3 == -addr && $4 == 127.0.0.1:12345 ]]
+printf '{"task":"%s","passed":true,"failures":[]}\n' "$2"
+`, 0o755)
+	t.Setenv("GOPROXY", "https://unused.invalid")
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for _, tc := range []struct {
+		name, fail string
+		code       int
+	}{
+		{"generates and checks", "no", 0},
+		{"make failure", "yes", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TEST_GEN_FAIL", tc.fail)
+			work := t.TempDir()
+			out, code := run([]string{"-runner", "direct", "-product", product, "-no-patch", "-task", "sm-create-get",
+				"-work", work, "-p0check", p0check, "-gen-script", "../../scripts/p0-gen-tree.sh", "-script", "../../scripts/p0-check-tree.sh"}, io.Discard)
+			passed := tc.code == 0
+			if code != tc.code || out.GenOK != passed || out.BuildOK != passed || out.CheckPassed != passed {
+				t.Fatalf("run = (%d, %+v), want exit %d", code, out, tc.code)
+			}
+			if log, err := os.ReadFile(filepath.Join(work, "gen-out", "gen.log")); err != nil || !strings.Contains(string(log), "echo generated") {
+				t.Fatalf("generation log = %q, error = %v", log, err)
+			}
+			if passed && !slices.Equal(out.GenChangedPaths, []string{"output.gen.go"}) {
+				t.Fatalf("unexpected generation paths: %q", out.GenChangedPaths)
+			}
+		})
+	}
+}
+
+func TestGenerationScriptInfrastructureErrors(t *testing.T) {
+	tree := t.TempDir()
+	blockedOut := filepath.Join(t.TempDir(), "file")
+	writeTestFile(t, blockedOut, "not a directory", 0o644)
+	for _, args := range [][]string{nil, {filepath.Join(tree, "missing"), t.TempDir()}, {tree, blockedOut}} {
+		cmd := exec.CommandContext(t.Context(), "bash", append([]string{"../../scripts/p0-gen-tree.sh"}, args...)...)
+		if log, err := cmd.CombinedOutput(); err == nil || cmd.ProcessState.ExitCode() != 14 {
+			t.Fatalf("generation script with %q: expected exit 14, got %v with %s", args, err, log)
+		}
+	}
 }
 
 func TestCheckScriptGenerationOutputs(t *testing.T) {
-	const (
-		tree  = "abcdef0123456789abcdef0123456789abcdef01"
-		patch = "diff --git a/new.gen.go b/new.gen.go\nnew file mode 100644\n--- /dev/null\n+++ b/new.gen.go\n@@ -0,0 +1 @@\n+generated\n"
-		path  = "new.gen.go\n"
-	)
-	bin := t.TempDir()
+	product, bin := t.TempDir(), t.TempDir()
+	testGit(t, product, "init", "--template=")
+	writeTestFile(t, filepath.Join(product, ".gitignore"), "new.gen.go\n", 0o644)
+	writeTestFile(t, filepath.Join(product, ".gitattributes"), "*.go text eol=lf\n", 0o644)
+	for _, name := range []string{"delete.gen.go", "modify.gen.go"} {
+		writeTestFile(t, filepath.Join(product, name), "old\n", 0o644)
+	}
+	if err := os.MkdirAll(filepath.Join(product, writableDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(product, writableDir, "state.go"), "old\n", 0o644)
+	testGit(t, product, "add", "-A", "--")
+	testGit(t, product, "-c", gitName, "-c", gitEmail, "commit", "--no-gpg-sign", "-m", "Product")
+
+	rolePatch := filepath.Join(t.TempDir(), "role.diff")
+	writeTestFile(t, filepath.Join(product, writableDir, "state.go"), "role\n", 0o644)
+	writeTestFile(t, rolePatch, string(testGit(t, product, "diff", "--")), 0o644)
+	want := filepath.Join(t.TempDir(), "want")
+	testGit(t, product, "clone", "--no-hardlinks", "--", product, want)
+	role, err := os.ReadFile(rolePatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := git(want, role, "apply", "--index", "--"); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, want, "-c", gitName, "-c", gitEmail, "commit", "--no-gpg-sign", "-m", "Role")
+	roleTree := strings.TrimSpace(string(testGit(t, want, "rev-parse", "HEAD^{tree}")))
+	writeTestFile(t, filepath.Join(want, "new.gen.go"), "added\n", 0o644)
+	writeTestFile(t, filepath.Join(want, "modify.gen.go"), "modified\n", 0o644)
+	if err := os.Remove(filepath.Join(want, "delete.gen.go")); err != nil {
+		t.Fatal(err)
+	}
+	testGit(t, want, "add", "-f", "-A", "--")
+	wantTree := strings.TrimSpace(string(testGit(t, want, "write-tree")))
+	wantPatch := testGit(t, want, "diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames", "HEAD", "--")
+	wantHash := fmt.Sprintf("%x", sha256.Sum256(wantPatch))
+	wantPaths := []string{"delete.gen.go", "modify.gen.go", "new.gen.go"}
+
 	writeTestFile(t, filepath.Join(bin, "docker"), `#!/bin/bash
 set -eu
 for arg; do
     case "$arg" in
         *:/out) out=${arg%:/out} ;;
+        *:/tree) tree=${arg%:/tree}; phase=gen ;;
+        *:/tree:ro) tree=${arg%:/tree:ro}; phase=check ;;
     esac
 done
-cp -RP "$CHECKPATCH_TEST_OUTPUT/." "$out"
-exit "$CHECKPATCH_TEST_EXIT"
+[[ ! -e "$tree/.git" && ! -L "$tree/.git" ]]
+[[ $(cat "$tree/services/secretmanager/state.go") == role ]]
+if [[ $phase == gen ]]; then
+    case "$TEST_GEN_ACTION" in
+        change)
+            printf 'added\n' > "$tree/new.gen.go"
+            printf 'modified\n' > "$tree/modify.gen.go"
+            rm "$tree/delete.gen.go"
+            ;;
+        dotgit) mkdir "$tree/.git" ;;
+        nested-dotgit) mkdir -p "$tree/nested/.GiT" ;;
+        symlink) ln -s /no-such-path "$tree/link" ;;
+        fifo) mkfifo "$tree/pipe" ;;
+        large) head -c 5242881 /dev/zero | tr '\000' a > "$tree/large.gen.go" ;;
+    esac
+    printf 'forged generation output\n' > "$out/gen.diff"
+    exit "$TEST_GEN_EXIT"
+fi
+touch "$TEST_CHECK_RAN"
+if [[ "$TEST_CHECK_TAMPER" == true ]]; then
+    printf 'role\r\n' > "$tree/services/secretmanager/state.go"
+fi
+case "$TEST_CHECK_METADATA" in
+    fake)
+        printf '%s\n' 'ffffffffffffffffffffffffffffffffffffffff' > "$out/judged-tree.txt"
+        printf '%s\n' 'fake.gen.go' > "$out/gen-changed-paths.txt"
+        printf '%s\n' 'forged patch' > "$out/gen.diff"
+        printf '%s\n' 'forged artifact' > "$out/gen-patch.diff"
+        ;;
+    invalid-tree) printf 'NOT A TREE\n' > "$out/judged-tree.txt" ;;
+    multiline-tree) printf 'tree\n\n' > "$out/judged-tree.txt" ;;
+    oversized-tree) head -c 65 /dev/zero > "$out/judged-tree.txt" ;;
+    patch-symlink) ln -s /no-such-path "$out/gen.diff" ;;
+    paths-alone) printf 'fake.gen.go\n' > "$out/gen-changed-paths.txt" ;;
+    patch-alone) printf 'forged patch\n' > "$out/gen.diff" ;;
+esac
+case "$TEST_CHECK_EXIT" in
+    0) printf '%s\n' '{"task":"sm-create-get","passed":true,"failures":[]}' > "$out/p0check.json" ;;
+    1) printf '%s\n' '{"task":"sm-create-get","passed":false,"failures":[{"name":"get","message":"failed"}]}' > "$out/p0check.json" ;;
+esac
+exit "$TEST_CHECK_EXIT"
 `, 0o755)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 	for _, tc := range []struct {
-		name, gen, paths, treeFile, wantError string
-		scriptCode, code                      int
-		wantMetadata, omitTree, symlinkPatch  bool
+		name, gen, metadata, wantError string
+		genExit, checkExit, code       int
+		snapshot, build, tamper        bool
 	}{
-		{name: "patch", gen: patch, paths: path, treeFile: tree + "\n", wantMetadata: true},
-		{name: "no changes without final newline", treeFile: tree, wantMetadata: true},
-		{name: "build failure", gen: patch, paths: path, treeFile: tree, scriptCode: 11, code: 1, wantError: "build failed", wantMetadata: true},
-		{name: "check failure", gen: patch, paths: path, treeFile: tree, scriptCode: 1, code: 1, wantMetadata: true},
-		{name: "unexpected check exit", gen: patch, paths: path, treeFile: tree, scriptCode: 14, code: 2, wantError: "check script exited 14", wantMetadata: true},
-		{name: "generation failure", scriptCode: 10, code: 1, omitTree: true, wantError: "generation failed"},
-		{name: "snapshot failure", scriptCode: 14, code: 2, omitTree: true, wantError: "read judged tree"},
-		{name: "invalid tree ID", treeFile: strings.ToUpper(tree), code: 2, wantError: "40 lowercase hex"},
-		{name: "multiple final newlines", treeFile: tree + "\n\n", code: 2, wantError: "40 lowercase hex"},
-		{name: "oversized tree file", treeFile: strings.Repeat("a", 65), code: 2, wantError: "exceeds 64 bytes"},
-		{name: "missing tree file", omitTree: true, code: 2, wantError: "read judged tree"},
-		{name: "oversized patch", gen: strings.Repeat("a", maxGeneratedPatchSize+1), paths: path, treeFile: tree, code: 2, wantError: "exceeds 5242880 bytes"},
-		{name: "patch symlink", gen: patch, paths: path, treeFile: tree, symlinkPatch: true, code: 2, wantError: "expected regular output file"},
-		{name: "missing paths", gen: patch, treeFile: tree, code: 2, wantError: "inconsistent generated patch"},
-		{name: "unexpected paths", paths: path, treeFile: tree, code: 2, wantError: "inconsistent generated patch"},
+		{name: "patch", gen: "change", metadata: "fake", snapshot: true, build: true},
+		{name: "no changes", snapshot: true, build: true},
+		{name: "build failure", gen: "change", checkExit: 11, code: 1, wantError: "build failed", snapshot: true},
+		{name: "check failure", gen: "change", checkExit: 1, code: 1, snapshot: true, build: true},
+		{name: "emulator startup failure", checkExit: 12, code: 1, wantError: "emulator did not announce", snapshot: true, build: true},
+		{name: "p0check infrastructure failure", checkExit: 13, code: 1, wantError: "p0check could not run", snapshot: true, build: true},
+		{name: "unexpected check exit", gen: "change", checkExit: 14, code: 2, wantError: "check script exited 14", snapshot: true},
+		{name: "generation failure", gen: "change", genExit: 10, code: 1, wantError: "generation failed"},
+		{name: "generation infrastructure failure", gen: "change", genExit: 14, code: 2, wantError: "generation script exited 14"},
+		{name: "invalid check tree ID ignored", metadata: "invalid-tree", snapshot: true, build: true},
+		{name: "multiple final newlines in check tree ID ignored", metadata: "multiline-tree", snapshot: true, build: true},
+		{name: "oversized check tree file ignored", metadata: "oversized-tree", snapshot: true, build: true},
+		{name: "missing check tree file ignored", gen: "change", snapshot: true, build: true},
+		{name: "oversized patch", gen: "large", code: 2, wantError: "exceeds 5242880 bytes"},
+		{name: "check patch symlink ignored", metadata: "patch-symlink", snapshot: true, build: true},
+		{name: "missing check paths ignored", metadata: "patch-alone", snapshot: true, build: true},
+		{name: "unexpected check paths ignored", metadata: "paths-alone", snapshot: true, build: true},
+		{name: "generation creates symlink", gen: "symlink", code: 2, wantError: "not a regular file or directory"},
+		{name: "generation creates FIFO", gen: "fifo", code: 2, wantError: "not a regular file or directory"},
+		{name: "generation creates .git", gen: "dotgit", code: 2, wantError: "worktree contains a .git entry"},
+		{name: "generation creates nested .git", gen: "nested-dotgit", code: 2, wantError: "worktree contains a .git entry"},
+		{name: "check changes worktree bytes", tamper: true, code: 2, wantError: "worktree changed during check", snapshot: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fixture := t.TempDir()
-			t.Setenv("CHECKPATCH_TEST_OUTPUT", fixture)
-			t.Setenv("CHECKPATCH_TEST_EXIT", fmt.Sprint(tc.scriptCode))
-			writeTestFile(t, filepath.Join(fixture, "gen-changed-paths.txt"), tc.paths, 0o644)
-			genFile := filepath.Join(fixture, "gen.diff")
-			if tc.symlinkPatch {
-				if err := os.Symlink("gen-changed-paths.txt", genFile); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				writeTestFile(t, genFile, tc.gen, 0o644)
-			}
-			if !tc.omitTree {
-				writeTestFile(t, filepath.Join(fixture, "judged-tree.txt"), tc.treeFile, 0o644)
-			}
-			p0 := filepath.Join(fixture, "p0check.json")
-			switch tc.scriptCode {
-			case 0:
-				writeTestFile(t, p0, `{"task":"sm-create-get","passed":true,"failures":[]}`, 0o644)
-			case 1:
-				writeTestFile(t, p0, `{"task":"sm-create-get","passed":false,"failures":[{"name":"get","message":"failed"}]}`, 0o644)
-			}
+			work := t.TempDir()
+			checkRan := filepath.Join(work, "ran-check")
+			t.Setenv("TEST_GEN_ACTION", tc.gen)
+			t.Setenv("TEST_GEN_EXIT", fmt.Sprint(tc.genExit))
+			t.Setenv("TEST_CHECK_EXIT", fmt.Sprint(tc.checkExit))
+			t.Setenv("TEST_CHECK_METADATA", tc.metadata)
+			t.Setenv("TEST_CHECK_TAMPER", fmt.Sprint(tc.tamper))
+			t.Setenv("TEST_CHECK_RAN", checkRan)
 
-			opt := options{runner: "docker", work: t.TempDir(), taskID: "sm-create-get"}
-			output := filepath.Join(opt.work, "out")
-			out := record.CheckResult{}
-			code, err := runCheckScript(opt, filepath.Join(opt.work, "tree"), output, &out)
-			if code != tc.code || (err == nil) != (tc.wantError == "") || (err != nil && !strings.Contains(err.Error(), tc.wantError)) {
-				t.Fatalf("runCheckScript = (%d, %v), want (%d, %q)", code, err, tc.code, tc.wantError)
+			out, code := run([]string{"-runner", "docker", "-product", product, "-patch", rolePatch,
+				"-task", "sm-create-get", "-p0check", "fake", "-work", work, "-image", "fake", "-modcache", bin}, io.Discard)
+			if code != tc.code || (out.Error == "") != (tc.wantError == "") || !strings.Contains(out.Error, tc.wantError) {
+				t.Fatalf("run = (%d, %+v), want exit %d and error %q", code, out, tc.code, tc.wantError)
 			}
-			wantTree, wantHash := "", ""
-			if tc.wantMetadata {
-				wantTree = tree
-			}
-			artifact := filepath.Join(output, "gen-patch.diff")
-			if tc.wantMetadata && tc.gen != "" {
-				wantHash = fmt.Sprintf("%x", sha256.Sum256([]byte(tc.gen)))
-				data, err := os.ReadFile(artifact)
-				if err != nil || string(data) != tc.gen || !slices.Equal(out.GenChangedPaths, []string{strings.TrimSuffix(tc.paths, "\n")}) {
-					t.Fatalf("generated patch artifact or paths differ: file %v, paths %q", err, out.GenChangedPaths)
-				}
-			} else if _, err := os.Lstat(artifact); !os.IsNotExist(err) {
-				t.Fatalf("unexpected generated patch artifact: %v", err)
-			}
-			if out.JudgedTree != wantTree || out.GenPatchSHA256 != wantHash {
-				t.Fatalf("unexpected generation metadata: %+v", out)
-			}
-			if out.GenOK != tc.wantMetadata || out.BuildOK != (tc.wantMetadata && tc.scriptCode != 11) || out.CheckPassed != (tc.code == 0) {
+			if !out.PathsOK || !out.ApplyOK || out.GenOK != tc.snapshot || out.BuildOK != tc.build || out.CheckPassed != (tc.code == 0) {
 				t.Fatalf("unexpected judge status: %+v", out)
+			}
+			if _, err := os.Stat(checkRan); (tc.snapshot && err != nil) || (!tc.snapshot && !os.IsNotExist(err)) {
+				t.Fatalf("check phase marker: %v, want presence %t", err, tc.snapshot)
+			}
+			file := filepath.Join(work, "gen-patch.diff")
+			patch, err := os.ReadFile(file)
+			switch {
+			case !tc.snapshot:
+				if out.JudgedTree != "" || out.GenPatchSHA256 != "" || len(out.GenChangedPaths) != 0 || !os.IsNotExist(err) {
+					t.Fatalf("metadata after failed generation or snapshot: %+v, artifact error: %v", out, err)
+				}
+			case tc.gen == "change":
+				if err != nil || string(patch) != string(wantPatch) || out.JudgedTree != wantTree ||
+					out.GenPatchSHA256 != wantHash || !slices.Equal(out.GenChangedPaths, wantPaths) {
+					t.Fatalf("unexpected generated snapshot: %+v, patch %q, error %v", out, patch, err)
+				}
+			default:
+				if out.JudgedTree != roleTree || out.GenPatchSHA256 != "" || len(out.GenChangedPaths) != 0 || !os.IsNotExist(err) {
+					t.Fatalf("unexpected no-change snapshot: %+v, artifact error: %v", out, err)
+				}
 			}
 		})
 	}
+}
+
+func testGit(t *testing.T, dir string, args ...string) []byte {
+	t.Helper()
+	data, err := git(dir, nil, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func TestArchiveEntryPaths(t *testing.T) {

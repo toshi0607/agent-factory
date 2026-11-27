@@ -16,25 +16,27 @@ import (
 )
 
 type decision struct {
-	Accepted       bool     `json:"accepted"`
-	Reason         string   `json:"reason"`
-	WorkID         string   `json:"work_id"`
-	Role           string   `json:"role"`
-	Task           string   `json:"task"`
-	BaseCommit     string   `json:"base_commit"`
-	PatchSHA256    string   `json:"patch_sha256"`
-	GenPatchSHA256 *string  `json:"gen_patch_sha256"`
-	Paths          []string `json:"paths"`
-	GenPaths       []string `json:"gen_paths"`
-	PolicySHA256   string   `json:"policy_sha256"`
-	TreeSHA        string   `json:"tree_sha"`
-	JudgedTree     *string  `json:"judged_tree"`
+	Accepted               bool     `json:"accepted"`
+	Reason                 string   `json:"reason"`
+	WorkID                 string   `json:"work_id"`
+	Role                   string   `json:"role"`
+	Task                   string   `json:"task"`
+	BaseCommit             string   `json:"base_commit"`
+	PatchSHA256            string   `json:"patch_sha256"`
+	GenPatchSHA256         *string  `json:"gen_patch_sha256"`
+	Paths                  []string `json:"paths"`
+	GenPaths               []string `json:"gen_paths"`
+	PolicySHA256           string   `json:"policy_sha256"`
+	TreeSHA                string   `json:"tree_sha"`
+	JudgedTree             *string  `json:"judged_tree"`
+	AllowDependencyChanges bool     `json:"allow_dependency_changes"`
 }
 
 func verify(opt options) *failure {
 	d := decision{
 		WorkID: opt.workID, Role: opt.role, Task: opt.task, BaseCommit: opt.base,
 		Paths: []string{}, GenPaths: []string{},
+		AllowDependencyChanges: opt.allowDependencies,
 	}
 	problem := verifyPatch(opt, &d)
 	d.Accepted = problem == nil
@@ -83,14 +85,17 @@ func verifyPatch(opt options, d *decision) *failure {
 	if !ok {
 		return failed("unknown P0 task")
 	}
-	if _, problem := repo.inspect(p, task, patches, opt.allowDependencies, d); problem != nil {
+	if _, problem := repo.inspect(p, task, patches, d); problem != nil {
 		return problem
 	}
 	return d.checkJudgedTree()
 }
 
 func (d *decision) checkJudgedTree() *failure {
-	if d.JudgedTree != nil && d.TreeSHA != *d.JudgedTree {
+	if d.JudgedTree == nil {
+		return reject("judge result has no judged tree")
+	}
+	if d.TreeSHA != *d.JudgedTree {
 		return reject("judged tree mismatch")
 	}
 	return nil
@@ -138,11 +143,10 @@ func checkJudge(name string, patches patchData, d *decision) *failure {
 	if len(judge.Failures) != 0 || judge.Error != "" {
 		return reject("judge result reports failures or an error")
 	}
-	if judge.JudgedTree != "" {
-		d.JudgedTree = new(judge.JudgedTree)
-	} else if patches.generatedHash != nil || judge.GenPatchSHA256 != nil {
-		return reject("judge result lacks a judged tree")
+	if judge.JudgedTree == "" {
+		return reject("judge result has no judged tree")
 	}
+	d.JudgedTree = new(judge.JudgedTree)
 	if patches.generatedHash == nil {
 		if judge.GenPatchSHA256 != nil || len(judge.GenChangedPaths) != 0 {
 			return reject("judge result requires a generated patch")
@@ -159,7 +163,7 @@ func checkJudge(name string, patches patchData, d *decision) *failure {
 	return nil
 }
 
-func (r *repository) inspect(p policy.Policy, task p0.Task, patches patchData, allowDependencies bool, d *decision) (string, *failure) {
+func (r *repository) inspect(p policy.Policy, task p0.Task, patches patchData, d *decision) (string, *failure) {
 	clone, problem := r.clone()
 	if problem != nil {
 		return "", problem
@@ -208,10 +212,10 @@ func (r *repository) inspect(p policy.Policy, task p0.Task, patches patchData, a
 		case slices.Contains(rolePaths, name):
 			return "path appears in both patches"
 		case p.DependencyFile(name):
-			if !allowDependencies {
+			if !d.AllowDependencyChanges {
 				return "dependency file requires -allow-dependency-changes"
 			}
-		case !p.Generated(name):
+		case !p.GeneratedOutput(name):
 			return "path outside generated paths"
 		}
 		return ""

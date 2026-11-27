@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,46 @@ func Git(dir string, input []byte, args ...string) ([]byte, error) {
 
 // GitWithEnv adds only caller-supplied environment entries to the scrubbed environment.
 func GitWithEnv(dir string, input []byte, env []string, args ...string) ([]byte, error) {
+	cmd := gitCommand(dir, env, args)
+	cmd.Stdin = bytes.NewReader(input)
+	output, err := cmd.Output()
+	if exited, ok := errors.AsType[*exec.ExitError](err); ok {
+		return output, gitError(args, err, exited.Stderr)
+	}
+	if err != nil {
+		return nil, gitError(args, err, nil)
+	}
+	return output, nil
+}
+
+// GitWithEnvLimit rejects command output larger than limit bytes.
+func GitWithEnvLimit(dir string, env []string, limit int64, args ...string) ([]byte, error) {
+	cmd := gitCommand(dir, env, args)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, gitError(args, err, nil)
+	}
+	output, err := io.ReadAll(io.LimitReader(stdout, limit+1))
+	if err != nil || int64(len(output)) > limit {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("Git output exceeds %d bytes", limit)
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, gitError(args, err, stderr.Bytes())
+	}
+	return output, nil
+}
+
+func gitCommand(dir string, env []string, args []string) *exec.Cmd {
 	config := []string{
 		"-c", "core.hooksPath=/dev/null",
 		"-c", "core.fsmonitor=false",
@@ -41,13 +82,12 @@ func GitWithEnv(dir string, input []byte, env []string, args ...string) ([]byte,
 		"GIT_PROTOCOL_FROM_USER=0", "GIT_ALLOW_PROTOCOL=file",
 	}
 	cmd.Env = append(cmd.Env, env...)
-	cmd.Stdin = bytes.NewReader(input)
-	output, err := cmd.Output()
-	if exited, ok := errors.AsType[*exec.ExitError](err); ok {
-		return output, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(exited.Stderr)))
+	return cmd
+}
+
+func gitError(args []string, err error, stderr []byte) error {
+	if len(stderr) != 0 {
+		return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(stderr)))
 	}
-	if err != nil {
-		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
-	}
-	return output, nil
+	return fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 }

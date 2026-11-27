@@ -20,7 +20,7 @@ const (
 	testWorkID     = "p0-20261127T012345Z-1234abcd"
 	testTargetRef  = "refs/heads/factory-f0"
 	stateFile      = "services/secretmanager/state.go"
-	generatedFile  = "services/secretmanager/state.gen.go"
+	generatedFile  = "services/secretmanager/elements.gen.go"
 	otherStateFile = "services/pubsub/state.go"
 	factoryID      = "1111111111111111111111111111111111111111"
 )
@@ -199,7 +199,10 @@ func TestVerify(t *testing.T) {
 		amend                    func(*record.CheckResult) string
 		change                   func(*testing.T, fixture, []string)
 	}{
-		{name: "edit"},
+		{name: "edit without judged tree", code: 1, reason: "judge result has no judged tree", amend: func(r *record.CheckResult) string {
+			r.JudgedTree = ""
+			return ""
+		}},
 		{name: "matching judged role tree", reportRoleTree: true},
 		{name: "new file", patch: add("services/secretmanager/new.go")},
 		{name: "delete", patch: deleteFile(stateFile)},
@@ -209,7 +212,12 @@ func TestVerify(t *testing.T) {
 "path with filter=" -text
 `)
 		}},
-		{name: "root generated", gen: add("root.gen.go")},
+		{name: "root generated", gen: add("root.gen.go"), code: 1, reason: "outside generated"},
+		{name: "protected generated", gen: add(".github/x.gen.go"), code: 1, reason: "protected path"},
+		{name: "coverage test", gen: add("docs/coverage/evil_test.go"), code: 1, reason: "outside generated", allow: true},
+		{name: "command generated", gen: add("cmd/x/zz.gen.go"), code: 1, reason: "outside generated"},
+		{name: "nested generated dependency", gen: add("docs/coverage/go.mod"), code: 1, reason: "dependency file requires"},
+		{name: "nested role dependency even with opt-in", patch: add("services/secretmanager/go.work"), allow: true, code: 1, reason: "dependency file in role patch"},
 		{name: "outside role", patch: add("outside.go"), code: 1, reason: "outside role"},
 		{name: "outside task", patch: edit(otherStateFile), code: 1, reason: "outside task"},
 		{name: "rename out", patch: move("rename", stateFile, otherStateFile), code: 1, reason: "outside task"},
@@ -256,11 +264,12 @@ func TestVerify(t *testing.T) {
 			r.GenChangedPaths = []string{generatedFile}
 			return ""
 		}},
-		{name: "generated patch without judged tree", gen: edit(generatedFile), code: 1, reason: "lacks a judged tree", amend: func(r *record.CheckResult) string {
+		{name: "generated patch without judged tree", gen: edit(generatedFile), code: 1, reason: "judge result has no judged tree", amend: func(r *record.CheckResult) string {
 			r.JudgedTree = ""
 			return ""
 		}},
-		{name: "generated patch hash without judged tree", code: 1, reason: "lacks a judged tree", amend: func(r *record.CheckResult) string {
+		{name: "generated patch hash without judged tree", code: 1, reason: "judge result has no judged tree", amend: func(r *record.CheckResult) string {
+			r.JudgedTree = ""
 			r.GenPatchSHA256 = digest([]byte(edit(generatedFile)))
 			return ""
 		}},
@@ -317,13 +326,10 @@ func TestVerify(t *testing.T) {
 			if patch == "" {
 				patch = edit(stateFile)
 			}
-			var judgedTree string
-			switch {
-			case tc.reportRoleTree || (tc.gen != "" && tc.code == 0):
+			// Rejections unrelated to the judged tree must reach their own checks.
+			judgedTree := factoryID
+			if tc.reportRoleTree || tc.code == 0 {
 				judgedTree = fixtureJudgedTree(t, f, patch, tc.gen)
-			case tc.gen != "":
-				// Supply an ID to exercise the intended rejection past the presence check.
-				judgedTree = factoryID
 			}
 			stageInputs(t, f, patch, tc.gen, judgedTree, tc.amend)
 			args := verifyArgs(f, tc.gen != "")
@@ -346,13 +352,12 @@ func TestVerify(t *testing.T) {
 				d.WorkID != testWorkID || d.BaseCommit != f.base || d.PatchSHA256 != digest([]byte(patch))) {
 				t.Fatalf("incomplete accepted decision: %+v", d)
 			}
+			raw := loadJSON[map[string]json.RawMessage](t, f.decision)
+			if want := fmt.Sprint(tc.allow); string(raw["allow_dependency_changes"]) != want {
+				t.Fatalf("decision allow_dependency_changes = %s, want %s", raw["allow_dependency_changes"], want)
+			}
 			if d.Accepted {
-				raw := loadJSON[map[string]json.RawMessage](t, f.decision)
-				want := "null"
-				if judgedTree != "" {
-					want = fmt.Sprintf("%q", judgedTree)
-				}
-				if string(raw["judged_tree"]) != want {
+				if want := fmt.Sprintf("%q", judgedTree); string(raw["judged_tree"]) != want {
 					t.Fatalf("decision judged_tree = %s, want %s", raw["judged_tree"], want)
 				}
 			}
@@ -368,7 +373,7 @@ func TestGeneratedPatchRoundTrip(t *testing.T) {
 		name, path string
 		remove     bool
 	}{
-		{name: "add", path: "services/secretmanager/new.gen.go"},
+		{name: "add", path: "services/secretmanager/register.gen.go"},
 		{name: "delete", path: generatedFile, remove: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -429,5 +434,5 @@ func replaceWithBinaryPatch(t *testing.T, f fixture, _ []string) {
 	put(t, name, "\x00\x01\x02")
 	patch := testGit(t, f.product, "diff", "--binary", "--", stateFile) + "\n"
 	put(t, name, "old\n")
-	stageInputs(t, f, patch, "", "", nil)
+	stageInputs(t, f, patch, "", factoryID, nil)
 }

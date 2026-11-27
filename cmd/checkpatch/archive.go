@@ -24,10 +24,13 @@ func initArchive(archive, base string) error {
 	if _, err := git(base, nil, "init", "--template="); err != nil {
 		return err
 	}
+	if err := configureRepository(base); err != nil {
+		return err
+	}
 	if _, err := git(base, nil, "add", "-f", "-A", "--"); err != nil {
 		return err
 	}
-	_, err := git(base, nil, "-c", gitName, "-c", gitEmail, "-c", "core.hooksPath=/dev/null",
+	_, err := git(base, nil, "-c", gitName, "-c", gitEmail,
 		"commit", "--no-gpg-sign", "--allow-empty", "-m", "Product archive baseline")
 	return err
 }

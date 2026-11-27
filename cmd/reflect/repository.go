@@ -15,21 +15,6 @@ import (
 	"github.com/toshi0607/agent-factory/internal/patchcheck"
 )
 
-const gitConfig = `[core]
-	repositoryformatversion = 0
-	filemode = true
-	protectHFS = true
-	protectNTFS = true
-	splitIndex = false
-	untrackedCache = false
-[gc]
-	auto = 0
-[maintenance]
-	auto = false
-[submodule]
-	recurse = false
-`
-
 var (
 	objectID = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	workID   = regexp.MustCompile(`^p0-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$`)
@@ -85,34 +70,11 @@ func openRepository(product string) (*repository, *failure) {
 		return nil, failed("cannot create temporary repository")
 	}
 	repo := &repository{product: product, metadata: metadata, common: filepath.Join(scratch, "common"), scratch: scratch}
-	if err := repo.isolateConfig(); err != nil {
+	if err := patchcheck.IsolateCommonDir(repo.metadata, repo.common); err != nil {
 		repo.close()
 		return nil, failed("cannot isolate product Git configuration")
 	}
 	return repo, nil
-}
-
-// Git uses the isolated common directory for config, attributes and hooks.
-// Only the object store and the refs needed to resolve HEAD are shared.
-func (r *repository) isolateConfig() error {
-	if err := os.Mkdir(r.common, 0o700); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(r.common, "config"), []byte(gitConfig), 0o600); err != nil {
-		return err
-	}
-	for _, name := range []string{"objects", "refs", "packed-refs", "shallow"} {
-		source := filepath.Join(r.metadata, name)
-		if _, err := os.Lstat(source); errors.Is(err, os.ErrNotExist) {
-			continue
-		} else if err != nil {
-			return err
-		}
-		if err := os.Symlink(source, filepath.Join(r.common, name)); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (r *repository) close() { _ = os.RemoveAll(r.scratch) }
@@ -130,10 +92,7 @@ func (r *repository) gitWithIndex(index string, input []byte, args ...string) ([
 }
 
 func (r *repository) gitEnv() []string {
-	return []string{
-		"GIT_DIR=" + r.metadata, "GIT_COMMON_DIR=" + r.common, "GIT_WORK_TREE=" + r.product,
-		"GIT_OPTIONAL_LOCKS=0",
-	}
+	return append(patchcheck.WorkTreeEnv(r.metadata, r.product), "GIT_COMMON_DIR="+r.common)
 }
 
 func (r *repository) checkBase(base string) *failure {
@@ -266,7 +225,7 @@ func (r *repository) clone() (string, *failure) {
 		return "", failed("cannot initialize local clone")
 	}
 	gitDir := filepath.Join(dir, ".git")
-	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte(gitConfig), 0o600); err != nil {
+	if err := patchcheck.ConfigureRepository(gitDir); err != nil {
 		return "", failed("cannot configure local clone")
 	}
 	// Borrow base objects locally. The clone has its own index, refs, and writes.

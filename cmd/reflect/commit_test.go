@@ -42,6 +42,7 @@ func TestCommit(t *testing.T) {
 		}},
 		{name: "tree changed", reason: "decision tree mismatch", change: func(_ *testing.T, _ fixture, d *decision, _ []string) {
 			d.TreeSHA = factoryID
+			d.JudgedTree = new(factoryID)
 		}},
 		{name: "judged tree changed", gen: edit(generatedFile), reason: "judged tree mismatch", change: func(_ *testing.T, _ fixture, d *decision, _ []string) {
 			d.JudgedTree = new(factoryID)
@@ -54,19 +55,16 @@ func TestCommit(t *testing.T) {
 		{name: "work id injection", reason: "invalid factory commit or work id", change: func(_ *testing.T, _ fixture, d *decision, _ []string) {
 			d.WorkID += "\nFactory-Role: other"
 		}},
-		{name: "dependency grant must be present at commit", gen: edit("go.sum"), reason: "dependency file requires"},
-		{name: "dependency grant present at commit", gen: edit("go.sum"), change: func(_ *testing.T, _ fixture, _ *decision, args []string) {
-			args[len(args)-1] = "-allow-dependency-changes"
+		{name: "dependency grant missing from decision", gen: edit("go.sum"), reason: "dependency file requires", change: func(_ *testing.T, _ fixture, d *decision, _ []string) {
+			d.AllowDependencyChanges = false
 		}},
+		{name: "dependency grant from decision", gen: edit("go.sum")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := setup(t, nil)
 			testGit(t, f.product, "branch", "other")
 			role := edit(stateFile)
-			var judgedTree string
-			if tc.gen != "" {
-				judgedTree = fixtureJudgedTree(t, f, role, tc.gen)
-			}
+			judgedTree := fixtureJudgedTree(t, f, role, tc.gen)
 			stageInputs(t, f, role, tc.gen, judgedTree, nil)
 			verify := verifyArgs(f, tc.gen != "")
 			if tc.gen == edit("go.sum") {
@@ -75,7 +73,10 @@ func TestCommit(t *testing.T) {
 			runExpect(t, verify, 0, "")
 			d := loadJSON[decision](t, f.decision)
 			refs := testGit(t, f.product, "for-each-ref", "refs/heads")
-			args := append(commitArgs(f, tc.gen != ""), "--")
+			args := commitArgs(f, tc.gen != "")
+			if tc.gen == edit("go.sum") {
+				runExpect(t, append(args, "-allow-dependency-changes"), 2, "flag provided but not defined")
+			}
 			if tc.change != nil {
 				tc.change(t, f, &d, args)
 				if err := writeJSON(f.decision, d); err != nil {

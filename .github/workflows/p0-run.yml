@@ -397,6 +397,7 @@ jobs:
           "$RUNNER_TEMP/bin/checkpatch" -product-archive "$RUNNER_TEMP/artifacts/p0-product/product.tar.gz" \
             -patch "$RUNNER_TEMP/artifacts/p0-collected/patch.diff" -task "$TASK" -p0check "$RUNNER_TEMP/bin/p0check" \
             -work "$RUNNER_TEMP/work" -runner docker -image "$CHECK_IMAGE" -modcache "$RUNNER_TEMP/modcache" \
+            -gen-script scripts/p0-gen-tree.sh -script scripts/p0-check-tree.sh \
             > "$RUNNER_TEMP/checkresult.json" || status=$?
           printf 'checkpatch exited %s\n' "$status"
           printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
@@ -423,7 +424,7 @@ jobs:
         if: always() && steps.check.outputs.status != ''
         run: |
           result="$RUNNER_TEMP/checkresult.json"
-          generated="$RUNNER_TEMP/work/out/gen-patch.diff"
+          generated="$RUNNER_TEMP/work/gen-patch.diff"
           if [[ -f "$result" && ! -L "$result" && -s "$result" ]]; then
             if [[ -f "$generated" && ! -L "$generated" ]]; then
               cp -- "$generated" "$RUNNER_TEMP/gen-patch.diff"

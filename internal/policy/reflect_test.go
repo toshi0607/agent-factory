@@ -63,11 +63,16 @@ func TestReflectPolicyValidation(t *testing.T) {
 		{"backslash", "write: [services/*/*.go]", "write: ['services\\*.go']", "write"},
 		{"too many patterns", "write: [services/*/*.go]", "write: [" + strings.Join(slices.Repeat([]string{"foo"}, 65), ", ") + "]", "at most 64"},
 		{"bad generated", "docs/coverage/**", "docs/?", "reflect.generated"},
-		{"bad dependency", "dependency_files: [go.mod, go.sum]", "dependency_files: ['[']", "reflect.dependency_files"},
+		{"bad generated output", "docs/coverage/*.md", "docs/?", "reflect.generated_outputs"},
+		{"missing generated outputs", "  generated_outputs:\n    - docs/coverage/*.md\n    - internal/protos/protos.gen.go\n    - services/register.gen.go\n    - services/*/elements.gen.go\n    - services/*/register.gen.go\n    - services/*/snapshot.json\n    - services/*/unimplemented.json\n", "", "reflect.generated_outputs is required"},
+		{"bad dependency", "dependency_files: [go.mod,", "dependency_files: ['[',", "reflect.dependency_files"},
 		{"bad protected", "- Makefile", "- /Makefile", "reflect.protected"},
 		{"missing target", "target_refs: [refs/heads/factory-f0]", "target_refs: []", "reflect.target_refs is required"},
 		{"target pattern", "target_refs: [refs/heads/factory-f0]", "target_refs: ['refs/heads/*']", "invalid exact ref"},
 		{"target shorthand", "target_refs: [refs/heads/factory-f0]", "target_refs: [factory-f0]", "invalid exact ref"},
+		{"target tag", "target_refs: [refs/heads/factory-f0]", "target_refs: [refs/tags/factory-f0]", "invalid exact ref"},
+		{"target remote", "target_refs: [refs/heads/factory-f0]", "target_refs: [refs/remotes/origin/main]", "invalid exact ref"},
+		{"target empty branch", "target_refs: [refs/heads/factory-f0]", "target_refs: [refs/heads/]", "invalid exact ref"},
 		{"target traversal", "target_refs: [refs/heads/factory-f0]", "target_refs: [refs/heads/../factory-f0]", "invalid exact ref"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -111,12 +116,35 @@ func TestReflectPolicyPermissions(t *testing.T) {
 			t.Errorf("generated path writable by role: %q", path)
 		}
 	}
-	for _, path := range []string{"go.mod", "go.sum"} {
+	for _, path := range []string{"go.mod", "go.sum", "go.work", "go.work.sum", "a/go.mod", "a/b/go.sum", "a/b/go.work", "a/b/go.work.sum"} {
 		if !p.DependencyFile(path) || p.RoleMayWrite("fixer", path) {
 			t.Errorf("dependency file writable by role: %q", path)
 		}
 	}
-	if p.DependencyFile("a/go.mod") || p.Protected("CLAUDE.md.backup") || !p.RoleMayWrite("fixer", "claude.md") {
+	if p.DependencyFile("a/xgo.mod") || p.Protected("CLAUDE.md.backup") || !p.RoleMayWrite("fixer", "claude.md") {
 		t.Fatal("path patterns did not respect case or segment boundaries")
+	}
+}
+
+func TestGeneratedOutputsAreGenerated(t *testing.T) {
+	p, err := Load("../../policy/google-cloud-emulator.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"docs/coverage/pubsub.md", "internal/protos/protos.gen.go", "services/register.gen.go",
+		"services/pubsub/elements.gen.go", "services/pubsub/register.gen.go", "services/pubsub/snapshot.json",
+		"services/pubsub/unimplemented.json",
+	} {
+		if !p.GeneratedOutput(path) || !p.Generated(path) || p.RoleMayWrite("fixer", path) {
+			t.Errorf("missing generated coverage for %q", path)
+		}
+	}
+}
+
+func TestTargetRefAllowedRequiresBranch(t *testing.T) {
+	p := Policy{Reflect: Reflect{TargetRefs: []string{"refs/tags/v1", "refs/heads/", "refs/heads/nested/branch"}}}
+	if p.TargetRefAllowed("refs/tags/v1") || p.TargetRefAllowed("refs/heads/") || !p.TargetRefAllowed("refs/heads/nested/branch") {
+		t.Fatal("expected only the full branch ref to be allowed")
 	}
 }

@@ -35,7 +35,6 @@ func run(args []string, stderr io.Writer) int {
 	if command != "push" {
 		flags.StringVar(&opt.patch, "patch", "", "role patch")
 		flags.StringVar(&opt.genPatch, "gen-patch", "", "optional generated patch")
-		flags.BoolVar(&opt.allowDependencies, "allow-dependency-changes", false, "allow generated dependency changes")
 		required = append(required, &opt.patch)
 	}
 	if command != "verify" {
@@ -46,6 +45,7 @@ func run(args []string, stderr io.Writer) int {
 	switch command {
 	case "verify":
 		check = verify
+		flags.BoolVar(&opt.allowDependencies, "allow-dependency-changes", false, "allow generated dependency changes")
 		flags.StringVar(&opt.role, "role", "", "policy role")
 		flags.StringVar(&opt.task, "task", "", "P0 task ID")
 		flags.StringVar(&opt.base, "base", "", "base commit")

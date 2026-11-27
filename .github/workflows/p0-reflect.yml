@@ -208,7 +208,9 @@ jobs:
           GIT_CONFIG_COUNT: '1'
           GIT_CONFIG_KEY_0: http.https://github.com/.extraheader
         run: |
-          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w 0)"
+          credential="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w 0)"
+          printf '::add-mask::%s\n' "$credential"
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $credential"
           printf '::add-mask::%s\n' "$GIT_CONFIG_VALUE_0"
           unset GITHUB_TOKEN
           export GIT_CONFIG_VALUE_0

@@ -85,7 +85,16 @@ reflect:
     - "**/*.gen.go"
     - docs/coverage/**
     - snapshot.json
+    - services/*/snapshot.json
     - "**/unimplemented.json"
-  dependency_files: [go.mod, go.sum]
+  generated_outputs:
+    - docs/coverage/*.md
+    - internal/protos/protos.gen.go
+    - services/register.gen.go
+    - services/*/elements.gen.go
+    - services/*/register.gen.go
+    - services/*/snapshot.json
+    - services/*/unimplemented.json
+  dependency_files: [go.mod, go.sum, go.work, go.work.sum, "**/go.mod", "**/go.sum", "**/go.work", "**/go.work.sum"]
   protected:
     - Makefile
