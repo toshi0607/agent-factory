@@ -173,8 +173,8 @@ func (p Policy) validate() error {
 	}
 	for name, role := range p.Roles {
 		if strings.TrimSpace(name) == "" || strings.TrimSpace(role.Agent) == "" ||
-			strings.TrimSpace(role.Model) == "" || strings.TrimSpace(role.Prompt) == "" || len(role.Egress) == 0 {
-			return fmt.Errorf("role %q requires a name, agent, model, prompt, and egress", name)
+			strings.TrimSpace(role.Model) == "" || strings.TrimSpace(role.Prompt) == "" {
+			return fmt.Errorf("role %q requires a name, agent, model, and prompt", name)
 		}
 		hosts := make(map[string]bool)
 		for _, ruleName := range role.Egress {

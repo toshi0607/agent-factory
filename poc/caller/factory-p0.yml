@@ -28,6 +28,7 @@ on:
           - fixer
           - probe
           - fixer-pinned
+          - probe-isolated
       budget_cents:
         description: LLM budget in USD cents (blank uses the policy)
         type: string

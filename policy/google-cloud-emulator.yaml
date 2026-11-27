@@ -79,6 +79,15 @@ roles:
       llm_usd_cents: 300
       minutes: 30
 
+  # F0: a probe with no egress at all, to show that nothing is reachable.
+  probe-isolated:
+    agent: claude
+    model: claude-haiku-5-5
+    prompt: prompts/probe.md
+    egress: []
+    budget:
+      llm_usd_cents: 100
+      minutes: 10
 reflect:
   target_refs: [refs/heads/factory-f0]
   generated:

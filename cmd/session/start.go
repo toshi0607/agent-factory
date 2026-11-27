@@ -76,7 +76,7 @@ func (r runner) start(ctx context.Context, policyPath, roleName, candidate, file
 	if err != nil {
 		return err
 	}
-	if roleName == "probe" && !slices.ContainsFunc(manifest.Files, func(file delivery.File) bool {
+	if probeRole(roleName) && !slices.ContainsFunc(manifest.Files, func(file delivery.File) bool {
 		return file.Name == probeScriptName
 	}) {
 		return errors.New("manifest is missing " + probeScriptName)
@@ -174,7 +174,7 @@ func (r runner) start(ctx context.Context, policyPath, roleName, candidate, file
 	if err := r.recordSession(ctx, s); err != nil {
 		return err
 	}
-	message, err := userMessage(created.Resources, filesByName, roleName == "probe")
+	message, err := userMessage(created.Resources, filesByName, probeRole(roleName))
 	if err != nil {
 		return err
 	}
@@ -184,8 +184,13 @@ func (r runner) start(ctx context.Context, policyPath, roleName, candidate, file
 	return nil
 }
 
+// probeRole reports whether a role runs the conditions probe instead of a task.
+func probeRole(name string) bool {
+	return name == "probe" || strings.HasPrefix(name, "probe-")
+}
+
 func allowedHosts(p policy.Policy, role policy.Role) []string {
-	var hosts []string
+	hosts := []string{}
 	seen := make(map[string]bool)
 	for _, rule := range role.Egress {
 		for _, host := range p.Egress[rule].AllowedHosts {

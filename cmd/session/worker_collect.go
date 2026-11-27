@@ -320,7 +320,7 @@ func (r runner) collectWorkerOutputs(ctx context.Context, id, out string, notes 
 func requiredWorkerOutputs(role, reason string, present map[string]bool) error {
 	var required []string
 	switch {
-	case role == "probe":
+	case probeRole(role):
 		required = []string{probeName}
 	case role == "fixer" && reason == stopCompleted:
 		required = []string{patchName, pathsName}

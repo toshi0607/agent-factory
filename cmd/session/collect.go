@@ -331,7 +331,7 @@ func (r runner) collectOutputs(ctx context.Context, s state, out string) (record
 	if err != nil {
 		return patch, nil, err
 	}
-	if files[patchName] == "" || files[pathsName] == "" || (s.Role == "probe" && files[probeName] == "") {
+	if files[patchName] == "" || files[pathsName] == "" || (probeRole(s.Role) && files[probeName] == "") {
 		// Outputs can become visible shortly after the status changes to idle.
 		if err := r.clock.Sleep(ctx, r.pollInterval); err != nil {
 			return patch, nil, err
