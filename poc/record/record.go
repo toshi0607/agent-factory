@@ -88,6 +88,7 @@ type Patch struct {
 type CheckResult struct {
 	Task            string    `json:"task"`
 	PatchSHA256     string    `json:"patch_sha256"`
+	GenPatchSHA256  string    `json:"gen_patch_sha256,omitempty"`
 	PathsOK         bool      `json:"paths_ok"`
 	ApplyOK         bool      `json:"apply_ok"`
 	GenOK           bool      `json:"gen_ok"`

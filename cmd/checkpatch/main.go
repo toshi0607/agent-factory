@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -11,10 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/toshi0607/agent-factory/internal/patchcheck"
 	"github.com/toshi0607/agent-factory/judge/google-cloud-emulator/p0"
 	"github.com/toshi0607/agent-factory/poc/record"
 )
@@ -143,7 +142,7 @@ func check(opt options, out *record.CheckResult) (int, error) {
 	}
 	if !opt.noPatch {
 		if _, err := git(tree, patch, "apply", "--index", "--"); err != nil {
-			return gitRejectionCode(err), err
+			return patchcheck.GitRejectionCode(err), err
 		}
 		if _, err := git(tree, nil, "-c", gitName, "-c", gitEmail,
 			"-c", "core.hooksPath=/dev/null", "commit", "--no-gpg-sign", "-m", "Apply candidate patch"); err != nil {
@@ -167,75 +166,6 @@ func createWorkDir(work string) error {
 		return fmt.Errorf("work directory must be empty: %s", work)
 	}
 	return nil
-}
-
-func inspectPatch(product, base string, task p0.Task, patch []byte) (int, error) {
-	numstat, err := git(product, patch, "apply", "--numstat", "-z", "--")
-	if err != nil {
-		return gitRejectionCode(err), err
-	}
-	summary, err := git(product, patch, "apply", "--summary", "--")
-	if err != nil {
-		return gitRejectionCode(err), err
-	}
-	paths, err := parseNumstat(numstat)
-	if err != nil {
-		return 2, err
-	}
-	if err := validatePaths(task, paths, string(summary), specialIndexMode.Match(patch)); err != nil {
-		return 1, err
-	}
-	// Inspect original paths too, since the usual prefix stripping can hide an
-	// initial slash or a leading traversal component.
-	raw, err := git(product, patch, "apply", "-p0", "--numstat", "-z", "--")
-	if err != nil {
-		return gitRejectionCode(err), err
-	}
-	rawPaths, err := parseNumstat(raw)
-	if err != nil {
-		return 2, err
-	}
-	if err := validateRelativePaths(rawPaths); err != nil {
-		return 1, err
-	}
-	tree, err := git(product, nil, "ls-tree", "-rz", "--full-tree", base)
-	if err != nil {
-		return 2, err
-	}
-	if err := validateBaseModes(paths, tree); err != nil {
-		return 1, err
-	}
-	return 0, nil
-}
-
-func gitRejectionCode(err error) int {
-	if _, ok := errors.AsType[*exec.ExitError](err); ok {
-		return 1
-	}
-	return 2
-}
-
-func git(dir string, input []byte, args ...string) ([]byte, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	cmd.Env = append(slices.DeleteFunc(cmd.Environ(), func(entry string) bool {
-		key, _, _ := strings.Cut(entry, "=")
-		switch key {
-		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES":
-			return true
-		default:
-			return false
-		}
-	}), "LC_ALL=C")
-	cmd.Stdin = bytes.NewReader(input)
-	output, err := cmd.Output()
-	if exited, ok := errors.AsType[*exec.ExitError](err); ok {
-		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(exited.Stderr)))
-	}
-	if err != nil {
-		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
-	}
-	return output, nil
 }
 
 func runCheckScript(opt options, tree, output string, out *record.CheckResult) (int, error) {

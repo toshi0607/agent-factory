@@ -21,6 +21,7 @@ type Policy struct {
 	Egress    map[string]Rule   `yaml:"egress"`
 	Roles     map[string]Role   `yaml:"roles"`
 	Pricing   map[string]Prices `yaml:"pricing,omitempty"`
+	Reflect   Reflect           `yaml:"reflect"`
 }
 
 type Product struct {
@@ -64,6 +65,7 @@ type Role struct {
 	Prompt string   `yaml:"prompt"`
 	Egress []string `yaml:"egress"`
 	Budget Budget   `yaml:"budget"`
+	Write  []string `yaml:"write"`
 }
 
 type Budget struct {
@@ -82,14 +84,15 @@ func Load(path string) (Policy, error) {
 	}
 	defer f.Close()
 
-	p, err := decode(f)
+	p, err := Decode(f)
 	if err != nil {
 		return Policy{}, fmt.Errorf("policy %s: %w", path, err)
 	}
 	return p, nil
 }
 
-func decode(r io.Reader) (Policy, error) {
+// Decode reads and validates one policy document.
+func Decode(r io.Reader) (Policy, error) {
 	var p Policy
 	dec := yaml.NewDecoder(r)
 	dec.KnownFields(true)
@@ -194,7 +197,7 @@ func (p Policy) validate() error {
 			return fmt.Errorf("role %q budget values must be positive", name)
 		}
 	}
-	return nil
+	return p.validateReflect()
 }
 
 func validHost(host string) bool {

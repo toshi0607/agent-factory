@@ -10,6 +10,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/toshi0607/agent-factory/internal/patchcheck"
 )
 
 func initArchive(archive, base string) error {
@@ -57,7 +59,7 @@ func extractArchive(archive, base string) error {
 		if err != nil {
 			return err
 		}
-		if name := h.Name; !filepath.IsLocal(name) || unsafeRelativePath(name) {
+		if name := h.Name; !filepath.IsLocal(name) || patchcheck.UnsafeRelativePath(name) {
 			return fmt.Errorf("unsafe archive path %q", name)
 		}
 		for component := range strings.SplitSeq(h.Name, "/") {

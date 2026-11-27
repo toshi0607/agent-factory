@@ -54,6 +54,7 @@ egress:
           - /google.golang.org/protobuf/@v/
 roles:
   fixer:
+    write: [services/*/*.go]
     agent: claude
     model: claude-opus-5-5
     prompt: prompts/fixer.md
@@ -77,3 +78,14 @@ roles:
     budget:
       llm_usd_cents: 300
       minutes: 30
+
+reflect:
+  target_refs: [refs/heads/factory-f0]
+  generated:
+    - "**/*.gen.go"
+    - docs/coverage/**
+    - snapshot.json
+    - "**/unimplemented.json"
+  dependency_files: [go.mod, go.sum]
+  protected:
+    - Makefile
