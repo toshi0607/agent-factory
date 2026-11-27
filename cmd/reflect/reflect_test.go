@@ -238,6 +238,7 @@ func TestVerify(t *testing.T) {
 		{name: "non-generated", gen: edit(otherStateFile), code: 1, reason: "outside generated"},
 		{name: "dependency without opt-in", gen: edit("go.sum"), code: 1, reason: "dependency file requires"},
 		{name: "dependency with opt-in", gen: edit("go.sum"), allow: true},
+		{name: "nested dependency with opt-in", gen: add("services/x/go.mod"), allow: true, code: 1, reason: "nested dependency file"},
 		{name: "overlap", gen: edit(stateFile), code: 1, reason: "both patches"},
 		{name: "judge hash", code: 1, reason: "judge patch hash mismatch", change: func(t *testing.T, f fixture, _ []string) {
 			put(t, f.patch, strings.Replace(edit(stateFile), "+new", "+New", 1))

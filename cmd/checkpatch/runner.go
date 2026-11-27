@@ -166,7 +166,7 @@ func dockerArgs(opt options, generation bool, tree, output string, uid, gid int)
 			"-v", opt.genScript+":/p0-gen-tree.sh:ro",
 			opt.image, "bash", "/p0-gen-tree.sh", "/tree", "/out")
 	}
-	return append(args, "-v", tree+":/tree:ro", "-v", opt.modcache+":/modcache",
+	return append(args, "-v", tree+":/tree:ro", "-v", opt.modcache+":/modcache:ro",
 		"-v", opt.p0check+":/p0check:ro", "-v", opt.script+":/p0-check-tree.sh:ro",
 		opt.image, "bash", "/p0-check-tree.sh", "/tree", opt.taskID, "/p0check", "/out")
 }

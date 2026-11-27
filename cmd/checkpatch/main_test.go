@@ -26,7 +26,7 @@ func TestDockerArgs(t *testing.T) {
 	}
 	wantCheck := append(slices.Clone(common),
 		"-v", "/work/out:/out", "-v", "/work/gocache:/gocache", "-w", "/tree",
-		"-v", "/work/tree:/tree:ro", "-v", "/module cache:/modcache",
+		"-v", "/work/tree:/tree:ro", "-v", "/module cache:/modcache:ro",
 		"-v", "/factory/bin/p0check:/p0check:ro", "-v", "/factory/scripts/p0-check-tree.sh:/p0-check-tree.sh:ro",
 		"image@sha256:fake", "bash", "/p0-check-tree.sh", "/tree", "sm-create-get", "/p0check", "/out",
 	)

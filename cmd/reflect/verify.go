@@ -215,6 +215,9 @@ func (r *repository) inspect(p policy.Policy, task p0.Task, patches patchData, d
 			if !d.AllowDependencyChanges {
 				return "dependency file requires -allow-dependency-changes"
 			}
+			if name != "go.mod" && name != "go.sum" {
+				return "nested dependency file"
+			}
 		case !p.GeneratedOutput(name):
 			return "path outside generated paths"
 		}
