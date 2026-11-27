@@ -43,6 +43,9 @@ func TestCommit(t *testing.T) {
 		{name: "tree changed", reason: "decision tree mismatch", change: func(_ *testing.T, _ fixture, d *decision, _ []string) {
 			d.TreeSHA = factoryID
 		}},
+		{name: "judged tree changed", gen: edit(generatedFile), reason: "judged tree mismatch", change: func(_ *testing.T, _ fixture, d *decision, _ []string) {
+			d.JudgedTree = new(factoryID)
+		}},
 		{name: "changed patch and matching fake decision hash", reason: "protected path", change: func(t *testing.T, f fixture, d *decision, _ []string) {
 			patch := add(".github/workflows/policy.yml")
 			put(t, f.patch, patch)
@@ -59,7 +62,12 @@ func TestCommit(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := setup(t, nil)
 			testGit(t, f.product, "branch", "other")
-			stageInputs(t, f, edit(stateFile), tc.gen, nil)
+			role := edit(stateFile)
+			var judgedTree string
+			if tc.gen != "" {
+				judgedTree = fixtureJudgedTree(t, f, role, tc.gen)
+			}
+			stageInputs(t, f, role, tc.gen, judgedTree, nil)
 			verify := verifyArgs(f, tc.gen != "")
 			if tc.gen == edit("go.sum") {
 				verify = append(verify, "-allow-dependency-changes")
@@ -139,7 +147,8 @@ func checkCommit(t *testing.T, f fixture, d decision) {
 
 func TestUntrustedGitConfiguration(t *testing.T) {
 	f := setup(t, nil)
-	stageInputs(t, f, edit(stateFile), edit(generatedFile), nil)
+	role, gen := edit(stateFile), edit(generatedFile)
+	stageInputs(t, f, role, gen, fixtureJudgedTree(t, f, role, gen), nil)
 	config := filepath.Join(f.product, ".git/config")
 	original, err := os.ReadFile(config)
 	if err != nil {
@@ -181,7 +190,8 @@ func TestShallowProduct(t *testing.T) {
 	testGit(t, f.product, "-c", "user.name=fixture", "-c", "user.email=fixture@invalid", "commit", "--allow-empty", "-m", "shallow tip")
 	f.base = testGit(t, f.product, "rev-parse", "HEAD")
 	put(t, filepath.Join(f.product, ".git/shallow"), f.base+"\n")
-	stageInputs(t, f, edit(stateFile), edit(generatedFile), nil)
+	role, gen := edit(stateFile), edit(generatedFile)
+	stageInputs(t, f, role, gen, fixtureJudgedTree(t, f, role, gen), nil)
 	runExpect(t, verifyArgs(f, true), 0, "")
 	runExpect(t, commitArgs(f, true), 0, "")
 	checkCommit(t, f, loadJSON[decision](t, f.decision))

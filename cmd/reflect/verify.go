@@ -28,6 +28,7 @@ type decision struct {
 	GenPaths       []string `json:"gen_paths"`
 	PolicySHA256   string   `json:"policy_sha256"`
 	TreeSHA        string   `json:"tree_sha"`
+	JudgedTree     *string  `json:"judged_tree"`
 }
 
 func verify(opt options) *failure {
@@ -75,15 +76,24 @@ func verifyPatch(opt options, d *decision) *failure {
 	if problem := checkRole(p, opt.role); problem != nil {
 		return problem
 	}
-	if problem := checkJudge(opt.judge, opt.task, patches); problem != nil {
+	if problem := checkJudge(opt.judge, patches, d); problem != nil {
 		return problem
 	}
 	task, ok := p0.Lookup(opt.task)
 	if !ok {
 		return failed("unknown P0 task")
 	}
-	_, problem = repo.inspect(p, task, patches, opt.allowDependencies, d)
-	return problem
+	if _, problem := repo.inspect(p, task, patches, opt.allowDependencies, d); problem != nil {
+		return problem
+	}
+	return d.checkJudgedTree()
+}
+
+func (d *decision) checkJudgedTree() *failure {
+	if d.JudgedTree != nil && d.TreeSHA != *d.JudgedTree {
+		return reject("judged tree mismatch")
+	}
+	return nil
 }
 
 func checkRole(p policy.Policy, role string) *failure {
@@ -96,7 +106,7 @@ func checkRole(p policy.Policy, role string) *failure {
 	return nil
 }
 
-func checkJudge(name, task string, patches patchData) *failure {
+func checkJudge(name string, patches patchData, d *decision) *failure {
 	data, problem := readLimited(name, "judge result", maxJudgeSize)
 	if problem != nil {
 		return problem
@@ -108,7 +118,7 @@ func checkJudge(name, task string, patches patchData) *failure {
 	if err := decodeJSON(data, &judge); err != nil {
 		return reject("invalid judge result JSON")
 	}
-	if judge.Task != task {
+	if judge.Task != d.Task {
 		return reject("judge task mismatch")
 	}
 	if judge.PatchSHA256 != patches.roleHash {
@@ -127,6 +137,11 @@ func checkJudge(name, task string, patches patchData) *failure {
 	}
 	if len(judge.Failures) != 0 || judge.Error != "" {
 		return reject("judge result reports failures or an error")
+	}
+	if judge.JudgedTree != "" {
+		d.JudgedTree = new(judge.JudgedTree)
+	} else if patches.generatedHash != nil || judge.GenPatchSHA256 != nil {
+		return reject("judge result lacks a judged tree")
 	}
 	if patches.generatedHash == nil {
 		if judge.GenPatchSHA256 != nil || len(judge.GenChangedPaths) != 0 {

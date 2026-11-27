@@ -2,6 +2,7 @@ package record
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -89,6 +90,7 @@ type CheckResult struct {
 	Task            string    `json:"task"`
 	PatchSHA256     string    `json:"patch_sha256"`
 	GenPatchSHA256  string    `json:"gen_patch_sha256,omitempty"`
+	JudgedTree      string    `json:"judged_tree,omitempty"`
 	PathsOK         bool      `json:"paths_ok"`
 	ApplyOK         bool      `json:"apply_ok"`
 	GenOK           bool      `json:"gen_ok"`
@@ -103,6 +105,8 @@ type Failure struct {
 	Name    string `json:"name"`
 	Message string `json:"message"`
 }
+
+var treeID = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 func (r Record) Validate() error {
 	if r.SchemaVersion != 1 {
@@ -128,6 +132,9 @@ func (r Record) Validate() error {
 	}
 	if r.FinishedAt.IsZero() {
 		return fmt.Errorf("finished_at is required")
+	}
+	if r.Check.JudgedTree != "" && !treeID.MatchString(r.Check.JudgedTree) {
+		return fmt.Errorf("judged_tree must be 40 lowercase hex characters")
 	}
 	return nil
 }

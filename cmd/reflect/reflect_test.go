@@ -110,13 +110,13 @@ func move(operation, old, new string) string {
 	return fmt.Sprintf("diff --git a/%s b/%s\nsimilarity index 100%%\n%s from %s\n%s to %s\n", old, new, operation, old, operation, new)
 }
 
-func stageInputs(t *testing.T, f fixture, patch, gen string, amend func(*record.CheckResult) string) {
+func stageInputs(t *testing.T, f fixture, patch, gen, judgedTree string, amend func(*record.CheckResult) string) {
 	t.Helper()
 	put(t, f.patch, patch)
 	judge := record.CheckResult{
 		Task: taskName, PatchSHA256: digest([]byte(patch)),
 		PathsOK: true, ApplyOK: true, GenOK: true, BuildOK: true, CheckPassed: true,
-		GenChangedPaths: []string{}, Failures: []record.Failure{},
+		GenChangedPaths: []string{}, Failures: []record.Failure{}, JudgedTree: judgedTree,
 	}
 	if gen != "" {
 		put(t, f.gen, gen)
@@ -131,6 +131,32 @@ func stageInputs(t *testing.T, f fixture, patch, gen string, amend func(*record.
 	} else if err := writeJSON(f.judge, judge); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func judgeCheckout(t *testing.T, f fixture, patch string) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "judge")
+	testGit(t, f.product, "clone", "--no-hardlinks", "--", f.product, dir)
+	testGit(t, dir, "checkout", "--detach", f.base)
+	applyFixturePatch(t, dir, patch)
+	testGit(t, dir, "-c", "user.name=fixture", "-c", "user.email=fixture@invalid", "commit", "-m", "Apply candidate patch")
+	return dir
+}
+
+func applyFixturePatch(t *testing.T, dir, patch string) {
+	t.Helper()
+	if _, err := patchcheck.Git(dir, []byte(patch), "apply", "--index", "--"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func fixtureJudgedTree(t *testing.T, f fixture, patch, gen string) string {
+	t.Helper()
+	dir := judgeCheckout(t, f, patch)
+	if gen != "" {
+		applyFixturePatch(t, dir, gen)
+	}
+	return testGit(t, dir, "write-tree")
 }
 
 func verifyArgs(f fixture, hasGen bool) []string {
@@ -168,11 +194,13 @@ func TestVerify(t *testing.T) {
 		name, patch, gen, reason string
 		code                     int
 		allow                    bool
+		reportRoleTree           bool
 		prepare                  func(*testing.T, string)
 		amend                    func(*record.CheckResult) string
 		change                   func(*testing.T, fixture, []string)
 	}{
 		{name: "edit"},
+		{name: "matching judged role tree", reportRoleTree: true},
 		{name: "new file", patch: add("services/secretmanager/new.go")},
 		{name: "delete", patch: deleteFile(stateFile)},
 		{name: "generated", gen: edit(generatedFile)},
@@ -228,6 +256,19 @@ func TestVerify(t *testing.T) {
 			r.GenChangedPaths = []string{generatedFile}
 			return ""
 		}},
+		{name: "generated patch without judged tree", gen: edit(generatedFile), code: 1, reason: "lacks a judged tree", amend: func(r *record.CheckResult) string {
+			r.JudgedTree = ""
+			return ""
+		}},
+		{name: "generated patch hash without judged tree", code: 1, reason: "lacks a judged tree", amend: func(r *record.CheckResult) string {
+			r.GenPatchSHA256 = digest([]byte(edit(generatedFile)))
+			return ""
+		}},
+		{name: "judged role tree mismatch", code: 1, reason: "judged tree mismatch", amend: func(r *record.CheckResult) string {
+			r.JudgedTree = factoryID
+			return ""
+		}},
+		{name: "judged generated tree mismatch", gen: edit(generatedFile), code: 1, reason: "judged tree mismatch"},
 		{name: "missing generated patch hash", gen: edit(generatedFile), code: 1, reason: "lacks a generated patch hash", amend: func(r *record.CheckResult) string {
 			r.GenPatchSHA256 = ""
 			return ""
@@ -276,7 +317,15 @@ func TestVerify(t *testing.T) {
 			if patch == "" {
 				patch = edit(stateFile)
 			}
-			stageInputs(t, f, patch, tc.gen, tc.amend)
+			var judgedTree string
+			switch {
+			case tc.reportRoleTree || (tc.gen != "" && tc.code == 0):
+				judgedTree = fixtureJudgedTree(t, f, patch, tc.gen)
+			case tc.gen != "":
+				// Supply an ID to exercise the intended rejection past the presence check.
+				judgedTree = factoryID
+			}
+			stageInputs(t, f, patch, tc.gen, judgedTree, tc.amend)
 			args := verifyArgs(f, tc.gen != "")
 			if tc.allow {
 				args = append(args, "-allow-dependency-changes")
@@ -297,9 +346,60 @@ func TestVerify(t *testing.T) {
 				d.WorkID != testWorkID || d.BaseCommit != f.base || d.PatchSHA256 != digest([]byte(patch))) {
 				t.Fatalf("incomplete accepted decision: %+v", d)
 			}
+			if d.Accepted {
+				raw := loadJSON[map[string]json.RawMessage](t, f.decision)
+				want := "null"
+				if judgedTree != "" {
+					want = fmt.Sprintf("%q", judgedTree)
+				}
+				if string(raw["judged_tree"]) != want {
+					t.Fatalf("decision judged_tree = %s, want %s", raw["judged_tree"], want)
+				}
+			}
 			if head := testGit(t, f.product, "rev-parse", "HEAD"); head != f.base {
 				t.Fatalf("verify changed HEAD to %s", head)
 			}
+		})
+	}
+}
+
+func TestGeneratedPatchRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		remove     bool
+	}{
+		{name: "add", path: "services/secretmanager/new.gen.go"},
+		{name: "delete", path: generatedFile, remove: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setup(t, nil)
+			role := edit(stateFile)
+			dir := judgeCheckout(t, f, role)
+			name := filepath.Join(dir, tc.path)
+			if tc.remove {
+				if err := os.Remove(name); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				put(t, name, "generated\n")
+			}
+			testGit(t, dir, "add", "-A")
+			gen, err := patchcheck.Git(dir, nil, "diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames", "HEAD")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tree := testGit(t, dir, "write-tree")
+			stageInputs(t, f, role, string(gen), tree, func(r *record.CheckResult) string {
+				r.GenChangedPaths = []string{tc.path}
+				return ""
+			})
+			runExpect(t, verifyArgs(f, true), 0, "")
+			d := loadJSON[decision](t, f.decision)
+			if d.TreeSHA != tree || d.JudgedTree == nil || *d.JudgedTree != tree || !slices.Equal(d.GenPaths, []string{tc.path}) {
+				t.Fatalf("unexpected generated tree decision: %+v", d)
+			}
+			runExpect(t, commitArgs(f, true), 0, "")
+			checkCommit(t, f, d)
 		})
 	}
 }
@@ -329,5 +429,5 @@ func replaceWithBinaryPatch(t *testing.T, f fixture, _ []string) {
 	put(t, name, "\x00\x01\x02")
 	patch := testGit(t, f.product, "diff", "--binary", "--", stateFile) + "\n"
 	put(t, name, "old\n")
-	stageInputs(t, f, patch, "", nil)
+	stageInputs(t, f, patch, "", "", nil)
 }

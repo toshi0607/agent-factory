@@ -58,6 +58,9 @@ func TestRecordJSONRoundTrip(t *testing.T) {
 			want := validRecord()
 			want.Candidate = tt.candidate
 			want.Sandbox = tt.sandbox
+			if tt.sandbox != nil {
+				want.Check.JudgedTree = strings.Repeat("a", 40)
+			}
 			data, err := json.Marshal(want)
 			if err != nil {
 				t.Fatal(err)
@@ -74,6 +77,9 @@ func TestRecordJSONRoundTrip(t *testing.T) {
 			}
 			if strings.Contains(string(data), `"sandbox":`) != (tt.sandbox != nil) {
 				t.Fatalf("unexpected sandbox encoding: %s", data)
+			}
+			if strings.Contains(string(data), `"judged_tree":`) != (want.Check.JudgedTree != "") {
+				t.Fatalf("unexpected judged_tree encoding: %s", data)
 			}
 			if !strings.Contains(string(data), `"started_at":"2026-11-19T01:00:00Z"`) {
 				t.Fatalf("expected RFC 3339 started_at: %s", data)
@@ -101,6 +107,8 @@ func TestRecordValidate(t *testing.T) {
 		{"missing model", "model", func(r *Record) { r.Model = "" }},
 		{"missing start time", "started_at", func(r *Record) { r.StartedAt = time.Time{} }},
 		{"missing finish time", "finished_at", func(r *Record) { r.FinishedAt = time.Time{} }},
+		{"short judged tree", "judged_tree", func(r *Record) { r.Check.JudgedTree = "abc" }},
+		{"uppercase judged tree", "judged_tree", func(r *Record) { r.Check.JudgedTree = strings.Repeat("A", 40) }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			r := validRecord()

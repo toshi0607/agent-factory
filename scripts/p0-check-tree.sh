@@ -34,7 +34,10 @@ if ! {
         while IFS= read -r -d '' entry; do
             printf '%s\n' "${entry:3}"
         done | LC_ALL=C sort >"$out/gen-changed-paths.txt" &&
-        git diff --no-ext-diff --no-textconv >"$out/gen.diff"
+        git -c core.hooksPath=/dev/null -c core.fsmonitor=false add -A &&
+        git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+            diff --cached --binary --no-ext-diff --no-textconv --no-renames HEAD >"$out/gen.diff" &&
+        git -c core.hooksPath=/dev/null -c core.fsmonitor=false write-tree >"$out/judged-tree.txt"
 } 2>"$out/gen-status.log"; then
     exit 14
 fi

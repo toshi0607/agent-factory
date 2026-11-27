@@ -48,6 +48,9 @@ func commit(opt options) *failure {
 	if !objectID.MatchString(d.BaseCommit) || !objectID.MatchString(d.TreeSHA) {
 		return reject("invalid decision base or tree id")
 	}
+	if problem := d.checkJudgedTree(); problem != nil {
+		return problem
+	}
 	if !objectID.MatchString(opt.factoryCommit) || !workID.MatchString(d.WorkID) {
 		return reject("invalid factory commit or work id")
 	}

@@ -10,9 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
+	"github.com/toshi0607/agent-factory/internal/delivery"
 	"github.com/toshi0607/agent-factory/internal/patchcheck"
 	"github.com/toshi0607/agent-factory/judge/google-cloud-emulator/p0"
 	"github.com/toshi0607/agent-factory/poc/record"
@@ -27,7 +30,11 @@ type options struct {
 const (
 	gitName  = "user.name=checkpatch"
 	gitEmail = "user.email=checkpatch@invalid"
+
+	maxGeneratedPatchSize = 5 << 20
 )
+
+var treeID = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 func main() {
 	out, code := run(os.Args[1:], os.Stderr)
@@ -202,25 +209,18 @@ func runCheckScript(opt options, tree, output string, out *record.CheckResult) (
 	switch scriptCode {
 	case 10:
 		return 1, fmt.Errorf("generation failed; see %s", filepath.Join(output, "gen.log"))
-	case 0, 1, 11, 12, 13:
-		out.GenOK = true
-		out.BuildOK = scriptCode != 11
+	case 0, 1, 11, 12, 13, 14:
+		// Exit 14 can also happen after the generation snapshot, if p0check exits unexpectedly.
 	default:
 		return 2, fmt.Errorf("check script exited %d; see %s", scriptCode, logPath)
 	}
 
-	readOutput := func(name string) ([]byte, error) {
-		return os.ReadFile(filepath.Join(output, name))
+	root, err := os.OpenRoot(output)
+	if err != nil {
+		return 2, fmt.Errorf("open output directory: %w", err)
 	}
-	if opt.runner == "docker" {
-		root, err := os.OpenRoot(output)
-		if err != nil {
-			return 2, fmt.Errorf("open output directory: %w", err)
-		}
-		defer root.Close()
-		readOutput = func(name string) ([]byte, error) { return readCheckOutput(root, name) }
-	}
-	data, err := readOutput("gen-changed-paths.txt")
+	defer root.Close()
+	data, err := readCheckOutput(root, "gen-changed-paths.txt", 0)
 	if err != nil {
 		return 2, fmt.Errorf("read generation paths: %w", err)
 	}
@@ -229,6 +229,33 @@ func runCheckScript(opt options, tree, output string, out *record.CheckResult) (
 			out.GenChangedPaths = append(out.GenChangedPaths, line)
 		}
 	}
+	genPatch, err := readCheckOutput(root, "gen.diff", maxGeneratedPatchSize)
+	if err != nil {
+		return 2, fmt.Errorf("read generated patch: %w", err)
+	}
+	data, err = readCheckOutput(root, "judged-tree.txt", 64)
+	if err != nil {
+		return 2, fmt.Errorf("read judged tree: %w", err)
+	}
+	judgedTree := strings.TrimSuffix(string(data), "\n")
+	if !treeID.MatchString(judgedTree) {
+		return 2, fmt.Errorf("judged-tree.txt must contain 40 lowercase hex characters")
+	}
+	if (len(genPatch) == 0) != (len(out.GenChangedPaths) == 0) {
+		return 2, fmt.Errorf("inconsistent generated patch and changed paths")
+	}
+	out.GenOK = true
+	out.BuildOK = scriptCode != 11
+	out.JudgedTree = judgedTree
+	if len(genPatch) != 0 {
+		if err := delivery.WriteAtomic(filepath.Join(output, "gen-patch.diff"), func(w io.Writer) error {
+			_, err := w.Write(genPatch)
+			return err
+		}); err != nil {
+			return 2, fmt.Errorf("write generated patch artifact: %w", err)
+		}
+		out.GenPatchSHA256 = fmt.Sprintf("%x", sha256.Sum256(genPatch))
+	}
 	switch scriptCode {
 	case 11:
 		return 1, fmt.Errorf("build failed; see %s", filepath.Join(output, "build.log"))
@@ -236,8 +263,10 @@ func runCheckScript(opt options, tree, output string, out *record.CheckResult) (
 		return 1, fmt.Errorf("emulator did not announce its address; see %s", filepath.Join(output, "emulator.log"))
 	case 13:
 		return 1, fmt.Errorf("p0check could not run; see %s", filepath.Join(output, "p0check.log"))
+	case 14:
+		return 2, fmt.Errorf("check script exited %d; see %s", scriptCode, logPath)
 	}
-	data, err = readOutput("p0check.json")
+	data, err = readCheckOutput(root, "p0check.json", 0)
 	if err != nil {
 		return 2, fmt.Errorf("read p0check result: %w", err)
 	}
@@ -258,7 +287,7 @@ func runCheckScript(opt options, tree, output string, out *record.CheckResult) (
 	return scriptCode, nil
 }
 
-func readCheckOutput(root *os.Root, name string) ([]byte, error) {
+func readCheckOutput(root *os.Root, name string, limit int64) ([]byte, error) {
 	info, err := root.Lstat(name)
 	if err != nil {
 		return nil, err
@@ -266,7 +295,30 @@ func readCheckOutput(root *os.Root, name string) ([]byte, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("expected regular output file %s", name)
 	}
-	return root.ReadFile(name)
+	// Recheck the opened file and avoid following a symlink or blocking on a FIFO.
+	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err = file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("expected regular output file %s", name)
+	}
+	if limit == 0 {
+		return io.ReadAll(file)
+	}
+	if info.Size() > limit {
+		return nil, fmt.Errorf("output file %s exceeds %d bytes", name, limit)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err == nil && int64(len(data)) > limit {
+		return nil, fmt.Errorf("output file %s exceeds %d bytes", name, limit)
+	}
+	return data, err
 }
 
 func dockerArgs(opt options, tree, output string, uid, gid int) []string {
