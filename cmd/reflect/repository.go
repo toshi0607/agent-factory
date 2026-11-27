@@ -122,14 +122,18 @@ func (r *repository) git(input []byte, args ...string) ([]byte, error) {
 }
 
 func (r *repository) gitWithIndex(index string, input []byte, args ...string) ([]byte, error) {
-	env := []string{
-		"GIT_DIR=" + r.metadata, "GIT_COMMON_DIR=" + r.common, "GIT_WORK_TREE=" + r.product,
-		"GIT_OPTIONAL_LOCKS=0", "GIT_ALLOW_PROTOCOL=",
-	}
+	env := append(r.gitEnv(), "GIT_ALLOW_PROTOCOL=")
 	if index != "" {
 		env = append(env, "GIT_INDEX_FILE="+index)
 	}
 	return patchcheck.GitWithEnv(r.product, input, env, args...)
+}
+
+func (r *repository) gitEnv() []string {
+	return []string{
+		"GIT_DIR=" + r.metadata, "GIT_COMMON_DIR=" + r.common, "GIT_WORK_TREE=" + r.product,
+		"GIT_OPTIONAL_LOCKS=0",
+	}
 }
 
 func (r *repository) checkBase(base string) *failure {

@@ -34,6 +34,9 @@ on:
       minutes:
         description: Time limit in minutes (blank uses the policy)
         type: string
+      reflect_to:
+        description: Target ref for the reflect stage, e.g. refs/heads/factory-f0 (blank skips)
+        type: string
 
 permissions: {}
 
@@ -58,3 +61,16 @@ jobs:
       workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
     secrets:
       worker_url: ${{ secrets.FACTORY_WORKER_URL }}
+
+  reflect:
+    needs: run
+    if: ${{ inputs.reflect_to != '' && inputs.role == 'fixer' && inputs.candidate == 'managed-agents' }}
+    permissions:
+      contents: write
+    # Replace both FACTORY_SHA placeholders with the same factory commit SHA.
+    uses: toshi0607/agent-factory/.github/workflows/p0-reflect.yml@FACTORY_SHA
+    with:
+      factory_ref: FACTORY_SHA
+      task: ${{ inputs.task }}
+      role: ${{ inputs.role }}
+      target_ref: ${{ inputs.reflect_to }}

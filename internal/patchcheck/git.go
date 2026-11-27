@@ -44,7 +44,7 @@ func GitWithEnv(dir string, input []byte, env []string, args ...string) ([]byte,
 	cmd.Stdin = bytes.NewReader(input)
 	output, err := cmd.Output()
 	if exited, ok := errors.AsType[*exec.ExitError](err); ok {
-		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(exited.Stderr)))
+		return output, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(exited.Stderr)))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)

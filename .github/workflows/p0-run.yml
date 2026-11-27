@@ -418,6 +418,26 @@ jobs:
       - name: Fail on a check infrastructure error
         if: steps.check.outputs.status == '2'
         run: exit 1
+      - name: Stage the check artifact
+        id: stage-check
+        if: always() && steps.check.outputs.status != ''
+        run: |
+          result="$RUNNER_TEMP/checkresult.json"
+          generated="$RUNNER_TEMP/work/out/gen-patch.diff"
+          if [[ -f "$result" && ! -L "$result" && -s "$result" ]]; then
+            if [[ -f "$generated" && ! -L "$generated" ]]; then
+              cp -- "$generated" "$RUNNER_TEMP/gen-patch.diff"
+            fi
+            printf 'ready=true\n' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@v7.0.2
+        if: always() && steps.stage-check.outputs.ready == 'true'
+        with:
+          name: p0-check
+          path: |
+            ${{ runner.temp }}/checkresult.json
+            ${{ runner.temp }}/gen-patch.diff
+          if-no-files-found: error
 
   record-probe:
     needs: collect

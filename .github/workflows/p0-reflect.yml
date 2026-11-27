@@ -1,0 +1,253 @@
+name: P0 reflect
+
+on:
+  workflow_call:
+    inputs:
+      factory_ref:
+        type: string
+        required: true
+      task:
+        type: string
+        required: true
+      role:
+        type: string
+        default: fixer
+      target_ref:
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  reflect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Validate reflect inputs
+        shell: bash
+        env:
+          FACTORY_REF: ${{ inputs.factory_ref }}
+          TASK: ${{ inputs.task }}
+          ROLE: ${{ inputs.role }}
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          if [[ ! "$FACTORY_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'factory_ref must be a full lowercase commit SHA\n' >&2
+            exit 1
+          fi
+          if [[ ! "$TARGET_REF" =~ ^refs/heads/[A-Za-z0-9._/-]{1,100}$ ]]; then
+            printf 'Invalid target_ref\n' >&2
+            exit 1
+          fi
+          if [[ ! "$TASK" =~ ^[a-z][a-z0-9-]{0,40}$ || ! "$ROLE" =~ ^[a-z][a-z0-9-]{0,40}$ ]]; then
+            printf 'Invalid task or role\n' >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: toshi0607/agent-factory
+          ref: ${{ inputs.factory_ref }}
+          path: factory
+          persist-credentials: false
+      - uses: actions/setup-go@v7.1.0
+        with:
+          go-version: '1.26.11'
+          check-latest: false
+          cache: false
+      - name: Build reflect CLI
+        id: build
+        working-directory: factory
+        env:
+          FACTORY_REF: ${{ inputs.factory_ref }}
+          CGO_ENABLED: '0'
+          GOTOOLCHAIN: local
+          GOFLAGS: -mod=readonly
+        run: |
+          factory_commit="$(git rev-parse HEAD)"
+          if [[ "$factory_commit" != "$FACTORY_REF" ]]; then
+            printf 'Factory checkout does not match factory_ref\n' >&2
+            exit 1
+          fi
+          printf 'factory_commit=%s\n' "$factory_commit" >> "$GITHUB_OUTPUT"
+          mkdir "$RUNNER_TEMP/bin"
+          go build -o "$RUNNER_TEMP/bin/reflect" ./cmd/reflect
+      - name: Create artifact directories
+        run: |
+          mkdir "$RUNNER_TEMP/artifacts" "$RUNNER_TEMP/reflect"
+          mkdir "$RUNNER_TEMP/artifacts/"{p0-collected,p0-check,p0-record}
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: p0-collected
+          path: ${{ runner.temp }}/artifacts/p0-collected
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: p0-check
+          path: ${{ runner.temp }}/artifacts/p0-check
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: p0-record
+          path: ${{ runner.temp }}/artifacts/p0-record
+      - name: Validate downloaded artifacts
+        run: |
+          artifacts="$RUNNER_TEMP/artifacts"
+          for dir in "$artifacts" "$artifacts/"{p0-collected,p0-check,p0-record}; do
+            if [[ ! -d "$dir" || -L "$dir" ]]; then
+              printf 'Expected a regular artifact directory\n' >&2
+              exit 1
+            fi
+          done
+          symlink="$(find "$artifacts" -type l -print -quit)"
+          if [[ -n "$symlink" ]]; then
+            printf 'Artifact directories must not contain symlinks\n' >&2
+            exit 1
+          fi
+          check_file() {
+            local file="$1" limit="$2" size
+            if [[ ! -f "$file" || -L "$file" ]]; then
+              printf 'Expected a regular %s file\n' "${file##*/}" >&2
+              exit 1
+            fi
+            size="$(stat -c %s -- "$file")"
+            if (( size > limit )); then
+              printf '%s exceeds its size limit\n' "${file##*/}" >&2
+              exit 1
+            fi
+          }
+          check_file "$artifacts/p0-collected/patch.diff" $((5 * 1024 * 1024))
+          check_file "$artifacts/p0-check/checkresult.json" $((1024 * 1024))
+          check_file "$artifacts/p0-record/record.json" $((1024 * 1024))
+          if [[ -e "$artifacts/p0-check/gen-patch.diff" ]]; then
+            check_file "$artifacts/p0-check/gen-patch.diff" $((5 * 1024 * 1024))
+          fi
+      - name: Read reflect record
+        id: record
+        env:
+          TASK: ${{ inputs.task }}
+        run: |
+          record="$RUNNER_TEMP/artifacts/p0-record/record.json"
+          if ! base="$(jq -ers --arg task "$TASK" '
+              select(length == 1) | .[0]
+              | select(.task == $task and .candidate == "managed-agents")
+              | .base_commit | @json' "$record")"; then
+            printf 'Expected one record with the requested task and managed-agents candidate\n' >&2
+            exit 1
+          fi
+          work_id="$(jq -ers '.[0].work_id | @json' "$record")"
+          # Validate the JSON string representation so control bytes cannot disappear in Bash.
+          if [[ ! "$base" =~ ^\"[0-9a-f]{40}\"$ || ! "$work_id" =~ ^\"p0-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\"$ ]]; then
+            printf 'Invalid record base_commit or work_id\n' >&2
+            exit 1
+          fi
+          printf 'base_commit=%s\nwork_id=%s\n' "${base//\"/}" "${work_id//\"/}" >> "$GITHUB_OUTPUT"
+      - name: Check out product base
+        uses: actions/checkout@v7.0.1
+        # Ignore runner-level filter configuration, including Git LFS smudge.
+        env:
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_ATTR_NOSYSTEM: '1'
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.hooksPath
+          GIT_CONFIG_VALUE_0: /dev/null
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ steps.record.outputs.base_commit }}
+          path: product
+          persist-credentials: false
+          set-safe-directory: false
+          fetch-depth: 1
+          lfs: false
+          submodules: false
+      - name: Verify patch
+        id: verify
+        env:
+          ROLE: ${{ inputs.role }}
+          TASK: ${{ inputs.task }}
+          BASE: ${{ steps.record.outputs.base_commit }}
+          WORK_ID: ${{ steps.record.outputs.work_id }}
+        run: |
+          artifacts="$RUNNER_TEMP/artifacts"
+          gen=()
+          if [[ -f "$artifacts/p0-check/gen-patch.diff" ]]; then
+            gen=(-gen-patch "$artifacts/p0-check/gen-patch.diff")
+          fi
+          status=0
+          "$RUNNER_TEMP/bin/reflect" verify -policy factory/policy/google-cloud-emulator.yaml \
+            -product product -role "$ROLE" -task "$TASK" -base "$BASE" -work-id "$WORK_ID" \
+            -patch "$artifacts/p0-collected/patch.diff" "${gen[@]}" \
+            -judge "$artifacts/p0-check/checkresult.json" -out "$RUNNER_TEMP/reflect/decision.json" || status=$?
+          printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          case "$status" in
+            1) printf 'Reflect rejected the patch. See decision.json in p0-reflect.\n' >&2 ;;
+            2) printf 'Reflect verification failed. See the step log and p0-reflect.\n' >&2 ;;
+          esac
+          exit "$status"
+      - name: Commit patch
+        id: commit
+        env:
+          FACTORY_COMMIT: ${{ steps.build.outputs.factory_commit }}
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          artifacts="$RUNNER_TEMP/artifacts"
+          gen=()
+          if [[ -f "$artifacts/p0-check/gen-patch.diff" ]]; then
+            gen=(-gen-patch "$artifacts/p0-check/gen-patch.diff")
+          fi
+          "$RUNNER_TEMP/bin/reflect" commit -policy factory/policy/google-cloud-emulator.yaml \
+            -product product -patch "$artifacts/p0-collected/patch.diff" "${gen[@]}" \
+            -decision "$RUNNER_TEMP/reflect/decision.json" -factory-commit "$FACTORY_COMMIT" \
+            -target-ref "$TARGET_REF" -out "$RUNNER_TEMP/reflect/commit.json"
+      - name: Push commit
+        id: push
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET_REF: ${{ inputs.target_ref }}
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: http.https://github.com/.extraheader
+        run: |
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w 0)"
+          printf '::add-mask::%s\n' "$GIT_CONFIG_VALUE_0"
+          unset GITHUB_TOKEN
+          export GIT_CONFIG_VALUE_0
+          exec "$RUNNER_TEMP/bin/reflect" push -policy factory/policy/google-cloud-emulator.yaml \
+            -product product -result "$RUNNER_TEMP/reflect/commit.json" \
+            -remote "https://github.com/${GITHUB_REPOSITORY}.git" -target-ref "$TARGET_REF" \
+            -out "$RUNNER_TEMP/reflect/push.json"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: p0-reflect
+          path: |
+            ${{ runner.temp }}/reflect/decision.json
+            ${{ runner.temp }}/reflect/commit.json
+            ${{ runner.temp }}/reflect/push.json
+          if-no-files-found: ignore
+      - name: Summarize reflect
+        if: always()
+        env:
+          TARGET_REF: ${{ inputs.target_ref }}
+          VERIFY_STATUS: ${{ steps.verify.outputs.status }}
+          COMMIT_OUTCOME: ${{ steps.commit.outcome }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
+        run: |
+          output="$RUNNER_TEMP/reflect"
+          {
+            printf '### P0 reflect\n\n'
+            case "$VERIFY_STATUS" in
+              0) printf '    Verification: accepted\n' ;;
+              1) printf '    Verification: rejected\n' ;;
+              2) printf '    Verification: error\n' ;;
+              *) printf '    Verification: not run\n' ;;
+            esac
+            if [[ -f "$output/decision.json" ]]; then
+              printf '    Reason: %s\n' "$(jq -c '.reason' "$output/decision.json")"
+            fi
+            if [[ -f "$output/commit.json" ]]; then
+              printf '    Commit: %s\n' "$(jq -r '.commit' "$output/commit.json")"
+            fi
+            printf '    Target ref: %q\n' "$TARGET_REF"
+            printf '    Commit step: %s\n    Push step: %s\n' "$COMMIT_OUTCOME" "$PUSH_OUTCOME"
+          } >> "$GITHUB_STEP_SUMMARY"

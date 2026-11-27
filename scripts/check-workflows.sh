@@ -24,6 +24,7 @@ import sys
 import yaml
 
 workflow_file, verify_file = sys.argv[1:3]
+reflect_file = ".github/workflows/p0-reflect.yml"
 
 def fail(file, message):
     sys.exit(f"{file}: {message}")
@@ -99,13 +100,25 @@ if len(sys.argv) > 3:
 
 try:
     with open(workflow_file, encoding="utf-8") as stream:
-        loader = (StrictLoader if workflow_file == verify_file else yaml.SafeLoader)(stream)
+        source = stream.read()
+        loader = (StrictLoader if workflow_file in (verify_file, reflect_file) else yaml.SafeLoader)(source)
         root = loader.get_single_node()
         workflow = loader.construct_document(root) if root is not None else None
 except (OSError, TypeError, ValueError, yaml.YAMLError):
     fail(workflow_file, "could not parse workflow YAML")
 if not isinstance(workflow, dict):
     fail(workflow_file, "define the workflow as a mapping")
+if workflow_file == reflect_file:
+    jobs = workflow.get("jobs")
+    if not isinstance(jobs, dict) or set(jobs) != {"reflect"}:
+        fail(workflow_file, "define exactly one job named reflect")
+    pushes = [step for step in jobs["reflect"].get("steps", []) if step.get("id") == "push"]
+    auth = pushes[0].get("env", {}).get("GITHUB_TOKEN") if len(pushes) == 1 else None
+    token = re.compile(r"""\b(?:github\s*(?:\.\s*token\b|\[\s*['"]token['"]\s*\])|secrets\s*(?:\.\s*github_token\b|\[\s*['"]github_token['"]\s*\]))""", re.I)
+    if (auth not in ("${{ github.token }}", "${{ secrets.GITHUB_TOKEN }}") or
+            not re.search(r'^\s*exec "\$RUNNER_TEMP/bin/reflect" push ', pushes[0].get("run", ""), re.M) or
+            len(token.findall(source)) != 1 or len(token.findall(yaml.safe_dump(workflow))) != 1):
+        fail(workflow_file, "pass the GitHub token exactly once as GITHUB_TOKEN in the reflect push step env")
 if workflow_file == verify_file:
     # Look up the literal key because YAML 1.1 resolves unquoted 'on' as a boolean.
     events_node = mapping_value(root, "on")
@@ -126,11 +139,12 @@ for name, job in workflow["jobs"].items():
             fail(workflow_file, f"use ubuntu-24.04 and set only GH_TOKEN to github.token in job {name}")
     permissions = job.get("permissions")
     oidc = permissions == "write-all" or isinstance(permissions, dict) and permissions.get("id-token") == "write"
+    contents_write = permissions == "write-all" or isinstance(permissions, dict) and permissions.get("contents") == "write"
     actions = permissions in ("read-all", "write-all") or isinstance(permissions, dict) and permissions.get("actions") in ("read", "write")
     recovery_permissions = permissions == {"id-token": "write", "contents": "read", "actions": "read"}
     emit("job", name, str(int(oidc)), str(int(permissions == {})),
          str(int(permissions == {"contents": "read"})), str(int(actions)), str(int(recovery_permissions)),
-         job.get("uses", ""))
+         str(int(contents_write)), str(int(permissions == {"contents": "write"})), job.get("uses", ""))
     if references is not None and job.get("uses") in references:
         uses = job["uses"]
         if not is_locked(uses):
@@ -173,6 +187,7 @@ PY
   else
     ruby -ryaml - "${args[@]}" <<'RUBY'
 workflow_file, verify_file, lock_file, *workflow_files = ARGV
+reflect_file = ".github/workflows/p0-reflect.yml"
 
 def emit(*values)
   abort "#{ARGV.fetch(0)}: expected string workflow fields" unless values.all? { |value| value.is_a?(String) }
@@ -263,7 +278,7 @@ end
 
 begin
   source = File.read(workflow_file, encoding: "UTF-8")
-  if workflow_file == verify_file
+  if [verify_file, reflect_file].include?(workflow_file)
     root, loader = strict_yaml(source)
     workflow = loader.accept(root)
   else
@@ -274,6 +289,20 @@ rescue SystemCallError, Psych::Exception, ArgumentError
   abort "#{workflow_file}: could not parse workflow YAML"
 end
 abort "#{workflow_file}: define the workflow as a mapping" unless workflow.is_a?(Hash)
+if workflow_file == reflect_file
+  jobs = workflow["jobs"]
+  unless jobs.is_a?(Hash) && jobs.keys == ["reflect"]
+    abort "#{workflow_file}: define exactly one job named reflect"
+  end
+  pushes = jobs["reflect"].fetch("steps", []).select { |step| step["id"] == "push" }
+  auth = pushes.first.dig("env", "GITHUB_TOKEN") if pushes.size == 1
+  token = /\b(?:github\s*(?:\.\s*token\b|\[\s*['"]token['"]\s*\])|secrets\s*(?:\.\s*github_token\b|\[\s*['"]github_token['"]\s*\]))/i
+  unless ["${{ github.token }}", "${{ secrets.GITHUB_TOKEN }}"].include?(auth) &&
+         pushes.first.fetch("run", "").match?(/^\s*exec "\$RUNNER_TEMP\/bin\/reflect" push /) &&
+         source.scan(token).size == 1 && workflow.to_yaml.scan(token).size == 1
+    abort "#{workflow_file}: pass the GitHub token exactly once as GITHUB_TOKEN in the reflect push step env"
+  end
+end
 if workflow_file == verify_file
   # Look up the literal key because YAML 1.1 resolves unquoted 'on' as a boolean.
   events_node = mapping_value(root, "on")
@@ -300,11 +329,13 @@ workflow.fetch("jobs").each do |name, job|
   end
   permissions = job["permissions"]
   oidc = permissions == "write-all" || permissions.is_a?(Hash) && permissions["id-token"] == "write"
+  contents_write = permissions == "write-all" || permissions.is_a?(Hash) && permissions["contents"] == "write"
   actions = ["read-all", "write-all"].include?(permissions) || permissions.is_a?(Hash) && ["read", "write"].include?(permissions["actions"])
   recovery_permissions = permissions == {"id-token" => "write", "contents" => "read", "actions" => "read"}
   emit("job", name, oidc ? "1" : "0", permissions == {} ? "1" : "0",
        permissions == {"contents" => "read"} ? "1" : "0", actions ? "1" : "0",
-       recovery_permissions ? "1" : "0", job.fetch("uses", ""))
+       recovery_permissions ? "1" : "0", contents_write ? "1" : "0",
+       permissions == {"contents" => "write"} ? "1" : "0", job.fetch("uses", ""))
   if references && references.include?(job["uses"])
     uses = job["uses"]
     unless locked?(uses, references, dependencies)
@@ -366,6 +397,7 @@ pinned='@([[:xdigit:]]{40})$'
 action_version='^[a-zA-Z0-9-]+/[a-zA-Z0-9_.-]+(/[^/@[:space:]]+)*@v[0-9]+\.[0-9]+\.[0-9]+$'
 lockfile=.github/workflows/actions.lock
 verify_lockfile=.github/workflows/verify-lockfile.yml
+reflect_workflow=.github/workflows/p0-reflect.yml
 forbidden='(^|[^[:alnum:]_.-])(docker|make|go[[:space:]]+(test|run|generate))([^[:alnum:]_.-]|$)'
 build='(^|[^[:alnum:]_.-])go[[:space:]]+build([^[:alnum:]_.-]|$)'
 # Match literal -o arguments in run blocks, including quoted paths and -o=path.
@@ -438,6 +470,7 @@ validate_session_invocations() {
 
 validate_workflow() {
   local record name= oidc empty contents_read actions recovery_permissions uses locked persist repository factory pinned_go
+  local contents_write contents_write_only
   local factory_ref ref_guard checked_ref step_number script run_line directory artifact_path
   local downloads= outputs= commands output match
   local verify_job=0 verify_checkout=0 verify_runs=0
@@ -457,12 +490,19 @@ validate_workflow() {
         IFS= read -r -d '' contents_read
         IFS= read -r -d '' actions
         IFS= read -r -d '' recovery_permissions
+        IFS= read -r -d '' contents_write
+        IFS= read -r -d '' contents_write_only
         IFS= read -r -d '' uses
         [[ ${uses%%@*} != *[[:upper:]]* ]] || fail "use a lowercase reusable workflow name in job $name"
         if [[ $file == "$verify_lockfile" ]]; then
           [[ $verify_job == 0 ]] || fail 'define exactly one job'
           verify_job=1
           [[ $contents_read == 1 ]] || fail "set permissions for job $name to contents: read"
+        fi
+        if [[ $file == "$reflect_workflow" || ( $file == poc/caller/factory-p0.yml && $name == reflect ) ]]; then
+          [[ $contents_write_only == 1 ]] || fail "set permissions for job $name to contents: write only"
+        elif [[ $contents_write == 1 ]]; then
+          fail "grant contents: write only to the reflect workflow and its caller"
         fi
         step_number=0
         checked_ref=0
@@ -478,7 +518,7 @@ validate_workflow() {
         fi
         if [[ -n $uses && ! $uses =~ $pinned ]]; then
           # The caller templates are pinned when installed in the product repository.
-          if [[ $file != poc/caller/* || ! $uses =~ ^toshi0607/agent-factory/\.github/workflows/p0-(run|auth-check|check-only|recover)\.yml@FACTORY_SHA$ ]]; then
+          if [[ $file != poc/caller/* || ! $uses =~ ^toshi0607/agent-factory/\.github/workflows/p0-(run|auth-check|check-only|recover|reflect)\.yml@FACTORY_SHA$ ]]; then
             fail "pin the reusable workflow for job $name to a full commit SHA"
           fi
         fi
@@ -506,7 +546,7 @@ validate_workflow() {
             checked_ref=1
           elif [[ $script == "$factory_ref_guard"$'\n'* ]]; then
             case "$file:$name" in
-              .github/workflows/p0-run.yml:start|.github/workflows/p0-run.yml:collect|.github/workflows/p0-recover.yml:recover)
+              .github/workflows/p0-run.yml:start|.github/workflows/p0-run.yml:collect|.github/workflows/p0-recover.yml:recover|"$reflect_workflow":reflect)
                 checked_ref=1 ;;
             esac
           fi
@@ -562,19 +602,19 @@ validate_workflow() {
         if [[ $script == *'${{'* ]]; then
           fail "pass expressions into run steps of job $name through env"
         fi
-        if [[ $oidc == 1 ]]; then
+        if [[ $oidc == 1 || $file == "$reflect_workflow" ]]; then
           script=${script//$'\\\n'/}
           if [[ $script =~ $forbidden || $script =~ (^|[^[:alnum:]_.-])go[[:space:]]+-C ]]; then
-            fail "move product build and execution commands out of OIDC job $name"
+            fail "move product build and execution commands out of privileged job $name"
           fi
           if [[ $script =~ $build ]]; then
             directory=${directory#./}
             case $directory in
               factory|factory/*) ;;
-              *) fail "run factory builds in the factory directory in OIDC job $name" ;;
+              *) fail "run factory builds in the factory directory in privileged job $name" ;;
             esac
             if [[ /$directory/ == */../* || $script =~ $change_dir || $script == *../product* ]]; then
-              fail "keep the build inside the factory directory in OIDC job $name"
+              fail "keep the build inside the factory directory in privileged job $name"
             fi
           fi
         fi
@@ -592,6 +632,8 @@ validate_workflow() {
 
 file=$verify_lockfile
 [[ -f $file ]] || fail 'missing required workflow'
+file=$reflect_workflow
+[[ -f $file ]] || fail 'missing required workflow'
 shopt -s nullglob
 workflows=(.github/workflows/*.yml .github/workflows/*.yaml)
 for file in "${workflows[@]}" poc/caller/*.yml poc/caller/*.yaml; do
@@ -599,6 +641,8 @@ for file in "${workflows[@]}" poc/caller/*.yml poc/caller/*.yaml; do
   case $file in
     .github/workflows/p0-run.yml|.github/workflows/p0-recover.yml)
       allowed_secret='          FACTORY_WORKER_URL: ${{ secrets.worker_url }}' ;;
+    "$reflect_workflow")
+      allowed_secret='          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}' ;;
     poc/caller/factory-p0.yml|poc/caller/factory-p0-recover.yml)
       allowed_secret='      worker_url: ${{ secrets.FACTORY_WORKER_URL }}' ;;
   esac
