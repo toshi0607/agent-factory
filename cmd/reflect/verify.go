@@ -123,6 +123,9 @@ func checkJudge(name string, patches patchData, d *decision) *failure {
 	if err := decodeJSON(data, &judge); err != nil {
 		return reject("invalid judge result JSON")
 	}
+	if judge.Runner != "docker" {
+		return reject("judge result was not produced in containers")
+	}
 	if judge.Task != d.Task {
 		return reject("judge task mismatch")
 	}

@@ -2,7 +2,9 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -12,35 +14,80 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDockerArgs(t *testing.T) {
 	opt := options{taskID: "sm-create-get", image: "image@sha256:fake", modcache: "/module cache", work: "/work",
-		p0check: "/factory/bin/p0check", script: "/factory/scripts/p0-check-tree.sh", genScript: "/factory/scripts/p0-gen-tree.sh"}
-	common := []string{
-		"run", "--rm", "--network", "none", "--cap-drop", "ALL",
+		p0check: "/factory/bin/p0check", genScript: "/factory/scripts/p0-gen-tree.sh", buildScript: "/factory/scripts/p0-build-tree.sh"}
+	hardening := []string{
+		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges", "--pids-limit", "1024", "--memory", "4g",
-		"--user", "123:456", "--tmpfs", "/tmp:rw,exec,size=512m",
+		"--user", "123:456",
+	}
+	goEnv := []string{
+		"--tmpfs", "/tmp:rw,exec,size=512m",
 		"-e", "HOME=/tmp", "-e", "GOCACHE=/gocache", "-e", "GOMODCACHE=/modcache",
 		"-e", "GOFLAGS=-mod=readonly", "-e", "GOPROXY=off", "-e", "GOTOOLCHAIN=local",
 	}
-	wantCheck := append(slices.Clone(common),
-		"-v", "/work/out:/out", "-v", "/work/gocache:/gocache", "-w", "/tree",
+	wantBuild := slices.Concat([]string{"run", "--rm", "--network", "none", "--name", "build"}, hardening, goEnv, []string{
+		"-v", "/work/build-out:/out", "-v", "/work/gocache:/gocache", "-w", "/tree",
 		"-v", "/work/tree:/tree:ro", "-v", "/module cache:/modcache:ro",
-		"-v", "/factory/bin/p0check:/p0check:ro", "-v", "/factory/scripts/p0-check-tree.sh:/p0-check-tree.sh:ro",
-		"image@sha256:fake", "bash", "/p0-check-tree.sh", "/tree", "sm-create-get", "/p0check", "/out",
-	)
-	if got := dockerArgs(opt, false, "/work/tree", "/work/out", 123, 456); !slices.Equal(got, wantCheck) {
-		t.Fatalf("check Docker arguments\ngot  %q\nwant %q", got, wantCheck)
+		"-v", "/factory/scripts/p0-build-tree.sh:/p0-build-tree.sh:ro",
+		"image@sha256:fake", "bash", "/p0-build-tree.sh", "/tree", "/out",
+	})
+	if got := buildDockerArgs(opt, "/work/tree", "/work/build-out", "build", 123, 456); !slices.Equal(got, wantBuild) {
+		t.Fatalf("build Docker arguments\ngot  %q\nwant %q", got, wantBuild)
 	}
-	wantGen := append(common,
+	wantGen := slices.Concat([]string{"run", "--rm", "--network", "none"}, hardening, goEnv, []string{
 		"-v", "/work/gen-out:/out", "-v", "/work/gen-gocache:/gocache", "-w", "/tree",
 		"-v", "/work/tree:/tree", "-v", "/module cache:/modcache:ro",
 		"-v", "/factory/scripts/p0-gen-tree.sh:/p0-gen-tree.sh:ro",
 		"image@sha256:fake", "bash", "/p0-gen-tree.sh", "/tree", "/out",
-	)
-	if got := dockerArgs(opt, true, "/work/tree", "/work/gen-out", 123, 456); !slices.Equal(got, wantGen) {
+	})
+	if got := generationDockerArgs(opt, "/work/tree", "/work/gen-out", 123, 456); !slices.Equal(got, wantGen) {
 		t.Fatalf("generation Docker arguments\ngot  %q\nwant %q", got, wantGen)
+	}
+	wantProduct := slices.Concat([]string{"run", "--detach", "--name", "emulator", "--network", "isolated", "--network-alias", "product"}, hardening, []string{
+		"--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m",
+		"--log-driver", "local", "--log-opt", "max-size=1m", "--log-opt", "max-file=1", "--log-opt", "compress=false",
+		"-v", "/work/build-out:/product:ro", "--entrypoint", "/product/emulator",
+		"image@sha256:fake", "-addr", "0.0.0.0:8080",
+	})
+	if got := productDockerArgs(opt, "/work/build-out", "isolated", "emulator", 123, 456); !slices.Equal(got, wantProduct) {
+		t.Fatalf("product Docker arguments\ngot  %q\nwant %q", got, wantProduct)
+	}
+	wantJudge := slices.Concat([]string{"run", "--rm", "--name", "judge", "--network", "isolated"}, hardening, []string{
+		"-v", "/factory/bin/p0check:/p0check:ro", "-v", "/work/judge-out:/out", "--entrypoint", "/p0check",
+		"image@sha256:fake", "-task", "sm-create-get", "-addr", "product:8080", "-wait", "30s",
+	})
+	if got := judgeDockerArgs(opt, "/work/judge-out", "isolated", "judge", 123, 456); !slices.Equal(got, wantJudge) {
+		t.Fatalf("judge Docker arguments\ngot  %q\nwant %q", got, wantJudge)
+	}
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		forbidden []string
+	}{
+		{"product", wantProduct, []string{"/work/tree", "/module cache", "/factory/bin/p0check", "/work/judge-out", "/work/product-out"}},
+		{"judge", wantJudge, []string{"/work/tree", "/module cache", "/work/build-out"}},
+	} {
+		for i, arg := range tc.args {
+			if arg != "-v" || i+1 >= len(tc.args) {
+				continue
+			}
+			for _, source := range tc.forbidden {
+				if strings.HasPrefix(tc.args[i+1], source+":") {
+					t.Fatalf("%s container mounts %q", tc.name, tc.args[i+1])
+				}
+			}
+		}
+		if slices.Contains(tc.args, "host") || slices.Contains(tc.args, "bridge") || slices.Contains(tc.args, "-p") || slices.Contains(tc.args, "--publish") {
+			t.Fatalf("%s container is not confined to the internal network: %q", tc.name, tc.args)
+		}
+	}
+	if !slices.Contains(wantProduct, "--read-only") {
+		t.Fatalf("product container root filesystem is writable: %q", wantProduct)
 	}
 }
 
@@ -74,12 +121,12 @@ touch "$2/generated"
 printf '{"task":"%s","passed":true,"failures":[]}\n' "$2" > "$4/p0check.json"
 `, 0o644)
 	args := []string{"-product-archive", archive, "-task", "sm-create-get", "-p0check", "fake", "-work", work, "-gen-script", genScript, "-script", script, "-runner", "direct"}
-	out, code := run(append(slices.Clone(args), "-patch", filepath.Join(dir, "missing.diff")), io.Discard)
+	out, code := run(t.Context(), append(slices.Clone(args), "-patch", filepath.Join(dir, "missing.diff")), io.Discard)
 	if code != 2 || !strings.Contains(out.Error, "read patch") {
 		t.Fatalf("missing patch: exit %d, result %+v", code, out)
 	}
-	out, code = run(append(slices.Clone(args), "-no-patch"), io.Discard)
-	if code != 0 || !out.PathsOK || !out.ApplyOK || !out.GenOK || !out.BuildOK || !out.CheckPassed {
+	out, code = run(t.Context(), append(slices.Clone(args), "-no-patch"), io.Discard)
+	if code != 0 || out.Runner != "direct" || !out.PathsOK || !out.ApplyOK || !out.GenOK || !out.BuildOK || !out.CheckPassed {
 		t.Fatalf("archive check: exit %d, result %+v", code, out)
 	}
 	if out.JudgedTree != runGit("rev-parse", "HEAD^{tree}") || out.GenPatchSHA256 != "" {
@@ -138,7 +185,7 @@ printf '{"task":"%s","passed":true,"failures":[]}\n' "$2"
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("TEST_GEN_FAIL", tc.fail)
 			work := t.TempDir()
-			out, code := run([]string{"-runner", "direct", "-product", product, "-no-patch", "-task", "sm-create-get",
+			out, code := run(t.Context(), []string{"-runner", "direct", "-product", product, "-no-patch", "-task", "sm-create-get",
 				"-work", work, "-p0check", p0check, "-gen-script", "../../scripts/p0-gen-tree.sh", "-script", "../../scripts/p0-check-tree.sh"}, io.Discard)
 			passed := tc.code == 0
 			if code != tc.code || out.GenOK != passed || out.BuildOK != passed || out.CheckPassed != passed {
@@ -163,6 +210,51 @@ func TestGenerationScriptInfrastructureErrors(t *testing.T) {
 		if log, err := cmd.CombinedOutput(); err == nil || cmd.ProcessState.ExitCode() != 14 {
 			t.Fatalf("generation script with %q: expected exit 14, got %v with %s", args, err, log)
 		}
+	}
+}
+
+func TestBuildTreeScript(t *testing.T) {
+	tree, bin := t.TempDir(), t.TempDir()
+	writeTestFile(t, filepath.Join(bin, "go"), `#!/bin/bash
+set -eu
+[[ $# == 5 && $1 == build && $2 == -buildvcs=false && $3 == -o && $5 == ./cmd/google-cloud-emulator ]]
+[[ "$PWD" -ef "$TEST_BUILD_TREE" && "$GOPROXY" == off && "$GOTOOLCHAIN" == local && "$GONOPROXY" == none && "$GOSUMDB" == off ]]
+printf 'build log\n' >&2
+[[ $TEST_BUILD_FAIL == no ]] || exit 1
+printf 'built emulator\n' > "$4"
+`, 0o755)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GOPROXY", "https://unused.invalid")
+	t.Setenv("TEST_BUILD_TREE", tree)
+	for _, tc := range []struct {
+		name, fail string
+		code       int
+	}{
+		{"success", "no", 0},
+		{"build failed", "yes", 11},
+		{"missing tree", "no", 14},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TEST_BUILD_FAIL", tc.fail)
+			out, src := t.TempDir(), tree
+			if tc.code == 14 {
+				src = filepath.Join(tree, "missing")
+			}
+			cmd := exec.CommandContext(t.Context(), "bash", "../../scripts/p0-build-tree.sh", src, out)
+			if log, err := cmd.CombinedOutput(); cmd.ProcessState.ExitCode() != tc.code {
+				t.Fatalf("build script: expected exit %d, got %v with %s", tc.code, err, log)
+			}
+			if tc.code != 14 {
+				if log, err := os.ReadFile(filepath.Join(out, "build.log")); err != nil || string(log) != "build log\n" {
+					t.Fatalf("build.log = %q, error = %v", log, err)
+				}
+			}
+			if tc.code == 0 {
+				if binary, err := os.ReadFile(filepath.Join(out, "emulator")); err != nil || string(binary) != "built emulator\n" {
+					t.Fatalf("build output = %q, error = %v", binary, err)
+				}
+			}
+		})
 	}
 }
 
@@ -208,15 +300,39 @@ func TestCheckScriptGenerationOutputs(t *testing.T) {
 
 	writeTestFile(t, filepath.Join(bin, "docker"), `#!/bin/bash
 set -eu
+printf '%s\0' "$@" >> "$TEST_DOCKER_TRACE"
+printf '\0' >> "$TEST_DOCKER_TRACE"
+case "$1" in
+    logs)
+        if [[ $TEST_LARGE_LOGS == true ]]; then
+            head -c 1048580 /dev/zero | tr '\000' a
+            head -c 1048580 /dev/zero | tr '\000' b >&2
+        fi
+        exit 0
+        ;;
+    network)
+        if [[ $2 == rm && $TEST_CLEANUP_FAIL == true ]]; then
+            printf 'test network removal failure\n' >&2
+            exit 1
+        fi
+        exit 0
+        ;;
+    kill|rm) exit 0 ;;
+esac
+
 for arg; do
     case "$arg" in
         *:/out) out=${arg%:/out} ;;
         *:/tree) tree=${arg%:/tree}; phase=gen ;;
-        *:/tree:ro) tree=${arg%:/tree:ro}; phase=check ;;
+        *:/tree:ro) tree=${arg%:/tree:ro}; phase=build ;;
+        /p0check) phase=judge ;;
+        /product/emulator) phase=product ;;
     esac
 done
-[[ ! -e "$tree/.git" && ! -L "$tree/.git" ]]
-[[ $(cat "$tree/services/secretmanager/state.go") == role ]]
+if [[ $phase == gen || $phase == build ]]; then
+    [[ ! -e "$tree/.git" && ! -L "$tree/.git" ]]
+    [[ $(cat "$tree/services/secretmanager/state.go") == role ]]
+fi
 if [[ $phase == gen ]]; then
     case "$TEST_GEN_ACTION" in
         change)
@@ -233,9 +349,24 @@ if [[ $phase == gen ]]; then
     printf 'forged generation output\n' > "$out/gen.diff"
     exit "$TEST_GEN_EXIT"
 fi
-touch "$TEST_CHECK_RAN"
-if [[ "$TEST_CHECK_TAMPER" == true ]]; then
-    printf 'role\r\n' > "$tree/services/secretmanager/state.go"
+if [[ $phase == build ]]; then
+    if [[ $TEST_CHECK_TAMPER == true ]]; then
+        printf 'role\r\n' > "$tree/services/secretmanager/state.go"
+    fi
+    if [[ $TEST_CHECK_METADATA == forged-verdicts ]]; then
+        printf '%s\n' '{"task":"sm-create-get","passed":true,"failures":[]}' > "$out/p0check.json"
+    fi
+    exit "$TEST_BUILD_EXIT"
+fi
+if [[ $phase == product ]]; then
+    if [[ $TEST_CHECK_METADATA == forged-verdicts ]]; then
+        printf '%s\n' '{"task":"sm-create-get","passed":true,"failures":[]}' > "$TEST_WORK/product-out/p0check.json"
+    fi
+    exit "$TEST_PRODUCT_EXIT"
+fi
+if [[ $TEST_CANCEL == true ]]; then
+    touch "$TEST_WORK/judge-started"
+    exec sleep 30
 fi
 case "$TEST_CHECK_METADATA" in
     fake)
@@ -252,25 +383,33 @@ case "$TEST_CHECK_METADATA" in
     patch-alone) printf 'forged patch\n' > "$out/gen.diff" ;;
 esac
 case "$TEST_CHECK_EXIT" in
-    0) printf '%s\n' '{"task":"sm-create-get","passed":true,"failures":[]}' > "$out/p0check.json" ;;
-    1) printf '%s\n' '{"task":"sm-create-get","passed":false,"failures":[{"name":"get","message":"failed"}]}' > "$out/p0check.json" ;;
+    0) printf '%s\n' '{"task":"sm-create-get","passed":true,"failures":[]}' ;;
+    1) printf '%s\n' '{"task":"sm-create-get","passed":false,"failures":[{"name":"get","message":"failed"}]}' ;;
 esac
 exit "$TEST_CHECK_EXIT"
 `, 0o755)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	for _, tc := range []struct {
-		name, gen, metadata, wantError string
-		genExit, checkExit, code       int
-		snapshot, build, tamper        bool
+		name, gen, metadata, wantError  string
+		genExit, buildExit, productExit int
+		checkExit, code                 int
+		snapshot, build, tamper         bool
+		cancel, cleanupFail, largeLogs  bool
 	}{
 		{name: "patch", gen: "change", metadata: "fake", snapshot: true, build: true},
 		{name: "no changes", snapshot: true, build: true},
-		{name: "build failure", gen: "change", checkExit: 11, code: 1, wantError: "build failed", snapshot: true},
+		{name: "build failure", gen: "change", buildExit: 11, code: 1, wantError: "build failed", snapshot: true},
+		{name: "build infrastructure failure", buildExit: 14, code: 2, wantError: "build container exited 14", snapshot: true},
 		{name: "check failure", gen: "change", checkExit: 1, code: 1, snapshot: true, build: true},
-		{name: "emulator startup failure", checkExit: 12, code: 1, wantError: "emulator did not announce", snapshot: true, build: true},
-		{name: "p0check infrastructure failure", checkExit: 13, code: 1, wantError: "p0check could not run", snapshot: true, build: true},
-		{name: "unexpected check exit", gen: "change", checkExit: 14, code: 2, wantError: "check script exited 14", snapshot: true},
+		{name: "emulator startup failure", productExit: 126, code: 1, wantError: "product container could not run", snapshot: true, build: true},
+		{name: "Docker startup failure", productExit: 125, code: 2, wantError: "start product container: docker exited 125", snapshot: true, build: true},
+		{name: "p0check infrastructure failure", checkExit: 2, code: 1, wantError: "p0check could not run", snapshot: true, build: true},
+		{name: "unexpected check exit", gen: "change", checkExit: 14, code: 2, wantError: "judge container exited 14", snapshot: true, build: true},
+		{name: "forged verdicts ignored", metadata: "forged-verdicts", checkExit: 1, code: 1, snapshot: true, build: true},
+		{name: "cleanup failure preserves verdict", cleanupFail: true, snapshot: true, build: true},
+		{name: "product logs capped", largeLogs: true, snapshot: true, build: true},
+		{name: "cancel during judge", cancel: true, code: 2, wantError: "context canceled", snapshot: true, build: true},
 		{name: "generation failure", gen: "change", genExit: 10, code: 1, wantError: "generation failed"},
 		{name: "generation infrastructure failure", gen: "change", genExit: 14, code: 2, wantError: "generation script exited 14"},
 		{name: "invalid check tree ID ignored", metadata: "invalid-tree", snapshot: true, build: true},
@@ -285,28 +424,71 @@ exit "$TEST_CHECK_EXIT"
 		{name: "generation creates FIFO", gen: "fifo", code: 2, wantError: "not a regular file or directory"},
 		{name: "generation creates .git", gen: "dotgit", code: 2, wantError: "worktree contains a .git entry"},
 		{name: "generation creates nested .git", gen: "nested-dotgit", code: 2, wantError: "worktree contains a .git entry"},
-		{name: "check changes worktree bytes", tamper: true, code: 2, wantError: "worktree changed during check", snapshot: true},
+		{name: "check changes worktree bytes", tamper: true, code: 2, wantError: "worktree changed during check", snapshot: true, build: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			work := t.TempDir()
-			checkRan := filepath.Join(work, "ran-check")
+			trace := filepath.Join(work, "docker-trace")
 			t.Setenv("TEST_GEN_ACTION", tc.gen)
 			t.Setenv("TEST_GEN_EXIT", fmt.Sprint(tc.genExit))
+			t.Setenv("TEST_BUILD_EXIT", fmt.Sprint(tc.buildExit))
+			t.Setenv("TEST_PRODUCT_EXIT", fmt.Sprint(tc.productExit))
 			t.Setenv("TEST_CHECK_EXIT", fmt.Sprint(tc.checkExit))
 			t.Setenv("TEST_CHECK_METADATA", tc.metadata)
 			t.Setenv("TEST_CHECK_TAMPER", fmt.Sprint(tc.tamper))
-			t.Setenv("TEST_CHECK_RAN", checkRan)
+			t.Setenv("TEST_DOCKER_TRACE", trace)
+			t.Setenv("TEST_WORK", work)
+			t.Setenv("TEST_CANCEL", fmt.Sprint(tc.cancel))
+			t.Setenv("TEST_CLEANUP_FAIL", fmt.Sprint(tc.cleanupFail))
+			t.Setenv("TEST_LARGE_LOGS", fmt.Sprint(tc.largeLogs))
 
-			out, code := run([]string{"-runner", "docker", "-product", product, "-patch", rolePatch,
-				"-task", "sm-create-get", "-p0check", "fake", "-work", work, "-image", "fake", "-modcache", bin}, io.Discard)
+			ctx, stop := context.WithTimeout(t.Context(), 10*time.Second)
+			defer stop()
+			if tc.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				defer cancel()
+				go func(waitCtx context.Context) {
+					tick := time.NewTicker(10 * time.Millisecond)
+					defer tick.Stop()
+					for {
+						if _, err := os.Stat(filepath.Join(work, "judge-started")); err == nil {
+							cancel()
+							return
+						}
+						select {
+						case <-waitCtx.Done():
+							return
+						case <-tick.C:
+						}
+					}
+				}(ctx)
+			}
+			opt := options{taskID: "sm-create-get", work: work, p0check: filepath.Join(bin, "fake"), image: "fake", modcache: bin,
+				genScript: filepath.Join(bin, "gen.sh"), buildScript: filepath.Join(bin, "build.sh")}
+			var stderr bytes.Buffer
+			out, code := run(ctx, []string{"-runner", "docker", "-product", product, "-patch", rolePatch,
+				"-task", opt.taskID, "-p0check", opt.p0check, "-work", work, "-image", opt.image,
+				"-modcache", bin, "-gen-script", opt.genScript, "-build-script", opt.buildScript}, &stderr)
 			if code != tc.code || (out.Error == "") != (tc.wantError == "") || !strings.Contains(out.Error, tc.wantError) {
 				t.Fatalf("run = (%d, %+v), want exit %d and error %q", code, out, tc.code, tc.wantError)
 			}
-			if !out.PathsOK || !out.ApplyOK || out.GenOK != tc.snapshot || out.BuildOK != tc.build || out.CheckPassed != (tc.code == 0) {
+			if out.Runner != "docker" || !out.PathsOK || !out.ApplyOK || out.GenOK != tc.snapshot || out.BuildOK != tc.build || out.CheckPassed != (tc.code == 0) {
 				t.Fatalf("unexpected judge status: %+v", out)
 			}
-			if _, err := os.Stat(checkRan); (tc.snapshot && err != nil) || (!tc.snapshot && !os.IsNotExist(err)) {
-				t.Fatalf("check phase marker: %v, want presence %t", err, tc.snapshot)
+			if tc.checkExit == 1 && (len(out.Failures) != 1 || out.Failures[0].Name != "get") {
+				t.Fatalf("unexpected failures: %+v", out.Failures)
+			}
+			if strings.Contains(stderr.String(), "test network removal failure") != tc.cleanupFail {
+				t.Fatalf("cleanup stderr = %q", &stderr)
+			}
+			assertDockerCalls(t, opt, trace, tc.snapshot, tc.build, tc.productExit == 0, tc.cancel)
+			if tc.largeLogs {
+				data, err := os.ReadFile(filepath.Join(work, "product-out", "emulator.log"))
+				if err != nil || len(data) != 2<<20 || bytes.Count(data, []byte("a")) != 1<<20 ||
+					bytes.Count(data, []byte("b")) != 1<<20 {
+					t.Fatalf("product log: got %d bytes, error %v", len(data), err)
+				}
 			}
 			file := filepath.Join(work, "gen-patch.diff")
 			patch, err := os.ReadFile(file)
@@ -326,6 +508,74 @@ exit "$TEST_CHECK_EXIT"
 				}
 			}
 		})
+	}
+}
+
+func assertDockerCalls(t *testing.T, opt options, trace string, hasBuild, hasNetwork, hasJudge, canceled bool) {
+	t.Helper()
+	data, err := os.ReadFile(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got [][]string
+	for call := range strings.SplitSeq(strings.TrimSuffix(string(data), "\x00\x00"), "\x00\x00") {
+		got = append(got, strings.Split(call, "\x00"))
+	}
+	uid, gid := os.Getuid(), os.Getgid()
+	tree := filepath.Join(opt.work, "tree")
+	want := [][]string{generationDockerArgs(opt, tree, filepath.Join(opt.work, "gen-out"), uid, gid)}
+	if hasBuild {
+		if len(got) < 2 {
+			t.Fatalf("missing build command in %q", got)
+		}
+		i := slices.Index(got[1], "--name")
+		if i < 0 || i+1 >= len(got[1]) {
+			t.Fatalf("missing build container name in %q", got[1])
+		}
+		buildName := got[1][i+1]
+		name, ok := strings.CutSuffix(buildName, "-build")
+		if !ok || !strings.HasPrefix(name, "p0-check-") || name == "p0-check-" {
+			t.Fatalf("invalid build container name %q", buildName)
+		}
+		buildOut := filepath.Join(opt.work, "build-out")
+		want = append(want, buildDockerArgs(opt, tree, buildOut, buildName, uid, gid))
+		if hasNetwork {
+			network, product, judge := name+"-net", name+"-product", name+"-judge"
+			want = append(want,
+				[]string{"network", "create", "--internal", "--opt", "com.docker.network.bridge.gateway_mode_ipv4=isolated", network},
+				productDockerArgs(opt, buildOut, network, product, uid, gid))
+			if hasJudge {
+				want = append(want, judgeDockerArgs(opt, filepath.Join(opt.work, "judge-out"), network, judge, uid, gid))
+			}
+			want = append(want, []string{"kill", product}, []string{"logs", product}, []string{"rm", "-f", product})
+			if canceled {
+				want = append(want, []string{"rm", "-f", judge})
+			}
+			want = append(want, []string{"network", "rm", network})
+		}
+	}
+	if !slices.EqualFunc(got, want, slices.Equal[[]string]) {
+		t.Fatalf("Docker calls\ngot  %q\nwant %q", got, want)
+	}
+}
+
+func TestReadCheckOutput(t *testing.T) {
+	out := t.TempDir()
+	target := filepath.Join(t.TempDir(), "valid.json")
+	writeTestFile(t, target, "{}", 0o644)
+	result := filepath.Join(out, "p0check.json")
+	if err := os.Symlink(target, result); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCheckOutput(out); err == nil || !strings.Contains(err.Error(), "regular output file") {
+		t.Fatalf("expected symlink rejection, got %v", err)
+	}
+	if err := os.Remove(result); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, result, strings.Repeat(" ", 1<<20+1), 0o644)
+	if _, err := readCheckOutput(out); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected size limit rejection, got %v", err)
 	}
 }
 
@@ -379,7 +629,7 @@ func writeTestFile(t *testing.T, path, contents string, mode os.FileMode) {
 }
 
 func TestCheckRequiresRunner(t *testing.T) {
-	result, code := run([]string{"-product", "test", "-task", "sm-create-get", "-p0check", "test", "-work", "test", "-no-patch"}, io.Discard)
+	result, code := run(t.Context(), []string{"-product", "test", "-task", "sm-create-get", "-p0check", "test", "-work", "test", "-no-patch"}, io.Discard)
 	if code != 2 || result.Error != "invalid arguments" {
 		t.Fatalf("missing runner: exit %d, result %+v", code, result)
 	}

@@ -397,7 +397,7 @@ jobs:
           "$RUNNER_TEMP/bin/checkpatch" -product-archive "$RUNNER_TEMP/artifacts/p0-product/product.tar.gz" \
             -patch "$RUNNER_TEMP/artifacts/p0-collected/patch.diff" -task "$TASK" -p0check "$RUNNER_TEMP/bin/p0check" \
             -work "$RUNNER_TEMP/work" -runner docker -image "$CHECK_IMAGE" -modcache "$RUNNER_TEMP/modcache" \
-            -gen-script scripts/p0-gen-tree.sh -script scripts/p0-check-tree.sh \
+            -gen-script scripts/p0-gen-tree.sh -build-script scripts/p0-build-tree.sh \
             > "$RUNNER_TEMP/checkresult.json" || status=$?
           printf 'checkpatch exited %s\n' "$status"
           printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"

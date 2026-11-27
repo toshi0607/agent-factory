@@ -114,7 +114,7 @@ func stageInputs(t *testing.T, f fixture, patch, gen, judgedTree string, amend f
 	t.Helper()
 	put(t, f.patch, patch)
 	judge := record.CheckResult{
-		Task: taskName, PatchSHA256: digest([]byte(patch)),
+		Task: taskName, Runner: "docker", PatchSHA256: digest([]byte(patch)),
 		PathsOK: true, ApplyOK: true, GenOK: true, BuildOK: true, CheckPassed: true,
 		GenChangedPaths: []string{}, Failures: []record.Failure{}, JudgedTree: judgedTree,
 	}
@@ -245,6 +245,14 @@ func TestVerify(t *testing.T) {
 		}},
 		{name: "judge failed", code: 1, reason: "failed check", amend: func(r *record.CheckResult) string {
 			r.CheckPassed = false
+			return ""
+		}},
+		{name: "direct judge", code: 1, reason: "judge result was not produced in containers", amend: func(r *record.CheckResult) string {
+			r.Runner = "direct"
+			return ""
+		}},
+		{name: "missing judge runner", code: 1, reason: "judge result was not produced in containers", amend: func(r *record.CheckResult) string {
+			r.Runner = ""
 			return ""
 		}},
 		{name: "judge failure entry", code: 1, reason: "reports failures", amend: func(r *record.CheckResult) string {

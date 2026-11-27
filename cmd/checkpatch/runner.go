@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,16 +9,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/toshi0607/agent-factory/poc/record"
 )
 
-func judge(opt options, tree string, env []string, out *record.CheckResult) (int, error) {
-	genOut, checkOut := filepath.Join(opt.work, "gen-out"), filepath.Join(opt.work, "out")
+func judge(ctx context.Context, opt options, tree string, env []string, out *record.CheckResult, stderr io.Writer) (int, error) {
+	genOut := filepath.Join(opt.work, "gen-out")
 	genLog := filepath.Join(opt.work, "gen-script.log")
-	code, err := runPhase(opt, true, tree, genOut, genLog)
+	code, err := runGeneration(ctx, opt, tree, genOut, genLog)
 	switch {
 	case err != nil:
 		return 2, err
@@ -30,54 +31,107 @@ func judge(opt options, tree string, env []string, out *record.CheckResult) (int
 		return 2, fmt.Errorf("snapshot generated worktree: %w", err)
 	}
 
-	checkLog := filepath.Join(opt.work, "check-script.log")
-	code, runErr := runPhase(opt, false, tree, checkOut, checkLog)
-	if runErr != nil {
-		return 2, runErr
+	checkOut, checkLog := filepath.Join(opt.work, "out"), filepath.Join(opt.work, "check-script.log")
+	if opt.runner == "docker" {
+		code, err = runDockerCheck(ctx, opt, tree, out, stderr)
+	} else {
+		code, err = runDirectCheck(ctx, opt, tree, checkOut, checkLog)
 	}
-	current, err := stageTree(tree, env)
-	if err != nil {
-		return 2, fmt.Errorf("snapshot worktree after check: %w", err)
+	current, stageErr := stageTree(tree, env)
+	if stageErr != nil {
+		return 2, fmt.Errorf("snapshot worktree after check: %w", stageErr)
 	}
 	if current != out.JudgedTree {
 		return 2, fmt.Errorf("worktree changed during check: got %s, judged %s", current, out.JudgedTree)
 	}
-	return readCheckResult(opt.taskID, checkOut, checkLog, code, out)
+	if err != nil {
+		return code, err
+	}
+	if opt.runner == "docker" {
+		return readJudgeResult(opt.taskID, filepath.Join(opt.work, "judge-out"), code, out)
+	}
+	return readDirectCheckResult(opt.taskID, checkOut, checkLog, code, out)
 }
 
-func runPhase(opt options, generation bool, tree, output, logPath string) (int, error) {
+func runGeneration(ctx context.Context, opt options, tree, output, logPath string) (int, error) {
 	if err := os.Mkdir(output, 0o755); err != nil {
 		return 2, fmt.Errorf("create output directory: %w", err)
 	}
-	cmd := exec.Command("bash", opt.script, tree, opt.taskID, opt.p0check, output)
-	if generation {
-		cmd = exec.Command("bash", opt.genScript, tree, output)
-	}
 	if opt.runner == "docker" {
-		if err := os.Mkdir(buildCache(opt.work, generation), 0o755); err != nil {
+		if err := os.Mkdir(filepath.Join(opt.work, "gen-gocache"), 0o755); err != nil {
 			return 2, fmt.Errorf("create Go build cache: %w", err)
 		}
-		cmd = exec.Command("docker", dockerArgs(opt, generation, tree, output, os.Getuid(), os.Getgid())...)
+		return runToLogs(ctx, logPath, logPath, 0, "docker", generationDockerArgs(opt, tree, output, os.Getuid(), os.Getgid())...)
 	}
-	log, err := os.Create(logPath)
+	return runToLogs(ctx, logPath, logPath, 0, "bash", opt.genScript, tree, output)
+}
+
+func runDirectCheck(ctx context.Context, opt options, tree, output, logPath string) (int, error) {
+	if err := os.Mkdir(output, 0o755); err != nil {
+		return 2, fmt.Errorf("create output directory: %w", err)
+	}
+	return runToLogs(ctx, logPath, logPath, 0, "bash", opt.script, tree, opt.taskID, opt.p0check, output)
+}
+
+func runToLogs(ctx context.Context, stdoutPath, stderrPath string, limit int, name string, args ...string) (code int, err error) {
+	stdout, err := os.Create(stdoutPath)
 	if err != nil {
-		return 2, fmt.Errorf("create script log: %w", err)
+		return 2, fmt.Errorf("create %s: %w", stdoutPath, err)
 	}
-	cmd.Stdout, cmd.Stderr = log, log
+	closeLog := func(file *os.File) {
+		if closeErr := file.Close(); closeErr != nil {
+			code, err = 2, errors.Join(err, closeErr)
+		}
+	}
+	defer closeLog(stdout)
+	stderr := stdout
+	if stderrPath != stdoutPath {
+		stderr, err = os.Create(stderrPath)
+		if err != nil {
+			return 2, fmt.Errorf("create %s: %w", stderrPath, err)
+		}
+		defer closeLog(stderr)
+	}
+	if limit > 0 {
+		return runCommand(ctx, &cappedLog{stdout, limit}, &cappedLog{stderr, limit}, name, args...)
+	}
+	return runCommand(ctx, stdout, stderr, name, args...)
+}
+
+type cappedLog struct {
+	file      *os.File
+	remaining int
+}
+
+func (log *cappedLog) Write(data []byte) (int, error) {
+	if size := min(len(data), log.remaining); size > 0 {
+		n, err := log.file.Write(data[:size])
+		log.remaining -= n
+		if err != nil {
+			return n, err
+		}
+	}
+	return len(data), nil
+}
+
+func runCommand(ctx context.Context, stdout, stderr io.Writer, name string, args ...string) (int, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.WaitDelay = 2 * time.Second
 	runErr := cmd.Run()
-	if err := log.Close(); err != nil {
-		return 2, fmt.Errorf("close script log: %w", err)
+	if err := ctx.Err(); err != nil {
+		return 2, fmt.Errorf("run %s: %w", name, err)
 	}
 	if exited, ok := errors.AsType[*exec.ExitError](runErr); ok {
 		return exited.ExitCode(), nil
 	}
 	if runErr != nil {
-		return 2, fmt.Errorf("run script: %w", runErr)
+		return 2, fmt.Errorf("run %s: %w", name, runErr)
 	}
 	return 0, nil
 }
 
-func readCheckResult(task, output, logPath string, code int, out *record.CheckResult) (int, error) {
+func readDirectCheckResult(task, output, logPath string, code int, out *record.CheckResult) (int, error) {
 	switch code {
 	case 11:
 		return 1, fmt.Errorf("build failed; see %s", filepath.Join(output, "build.log"))
@@ -92,7 +146,10 @@ func readCheckResult(task, output, logPath string, code int, out *record.CheckRe
 	default:
 		return 2, fmt.Errorf("check script exited %d; see %s", code, logPath)
 	}
+	return readJudgeResult(task, output, code, out)
+}
 
+func readJudgeResult(task, output string, code int, out *record.CheckResult) (int, error) {
 	data, err := readCheckOutput(output)
 	if err != nil {
 		return 2, fmt.Errorf("read p0check result: %w", err)
@@ -141,32 +198,10 @@ func readCheckOutput(output string) ([]byte, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("expected regular output file %s", name)
 	}
-	return io.ReadAll(file)
-}
-
-func buildCache(work string, generation bool) string {
-	if generation {
-		return filepath.Join(work, "gen-gocache")
+	const maxCheckOutputSize = 1 << 20
+	data, err := io.ReadAll(io.LimitReader(file, maxCheckOutputSize+1))
+	if err == nil && len(data) > maxCheckOutputSize {
+		return nil, fmt.Errorf("%s exceeds %d bytes", name, maxCheckOutputSize)
 	}
-	return filepath.Join(work, "gocache")
-}
-
-func dockerArgs(opt options, generation bool, tree, output string, uid, gid int) []string {
-	args := []string{
-		"run", "--rm", "--network", "none", "--cap-drop", "ALL",
-		"--security-opt", "no-new-privileges", "--pids-limit", "1024", "--memory", "4g",
-		"--user", strconv.Itoa(uid) + ":" + strconv.Itoa(gid), "--tmpfs", "/tmp:rw,exec,size=512m",
-		"-e", "HOME=/tmp", "-e", "GOCACHE=/gocache", "-e", "GOMODCACHE=/modcache",
-		"-e", "GOFLAGS=-mod=readonly", "-e", "GOPROXY=off", "-e", "GOTOOLCHAIN=local",
-		"-v", output + ":/out", "-v", buildCache(opt.work, generation) + ":/gocache",
-		"-w", "/tree",
-	}
-	if generation {
-		return append(args, "-v", tree+":/tree", "-v", opt.modcache+":/modcache:ro",
-			"-v", opt.genScript+":/p0-gen-tree.sh:ro",
-			opt.image, "bash", "/p0-gen-tree.sh", "/tree", "/out")
-	}
-	return append(args, "-v", tree+":/tree:ro", "-v", opt.modcache+":/modcache:ro",
-		"-v", opt.p0check+":/p0check:ro", "-v", opt.script+":/p0-check-tree.sh:ro",
-		opt.image, "bash", "/p0-check-tree.sh", "/tree", opt.taskID, "/p0check", "/out")
+	return data, err
 }

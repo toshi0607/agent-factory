@@ -88,6 +88,7 @@ type Patch struct {
 
 type CheckResult struct {
 	Task            string    `json:"task"`
+	Runner          string    `json:"runner,omitempty"`
 	PatchSHA256     string    `json:"patch_sha256"`
 	GenPatchSHA256  string    `json:"gen_patch_sha256,omitempty"`
 	JudgedTree      string    `json:"judged_tree,omitempty"`

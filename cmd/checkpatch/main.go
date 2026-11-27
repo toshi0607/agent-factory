@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/toshi0607/agent-factory/internal/patchcheck"
 	"github.com/toshi0607/agent-factory/judge/google-cloud-emulator/p0"
@@ -17,7 +20,7 @@ import (
 
 type options struct {
 	product, taskID, p0check, work, patch, script, genScript string
-	archive, runner, image, modcache                         string
+	archive, runner, image, modcache, buildScript            string
 	noPatch                                                  bool
 }
 
@@ -27,7 +30,9 @@ const (
 )
 
 func main() {
-	out, code := run(os.Args[1:], os.Stderr)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	out, code := run(ctx, os.Args[1:], os.Stderr)
+	stop()
 	if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		code = 2
@@ -35,12 +40,12 @@ func main() {
 	os.Exit(code)
 }
 
-func run(args []string, stderr io.Writer) (record.CheckResult, int) {
+func run(ctx context.Context, args []string, stderr io.Writer) (record.CheckResult, int) {
 	var opt options
 	flags := flag.NewFlagSet("checkpatch", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "usage: checkpatch (-product <dir> | -product-archive <tar.gz>) -task <id> -p0check <bin> -work <dir> (-patch <file> | -no-patch) (-runner direct | -runner docker -image <ref> -modcache <dir>) [-gen-script <file>] [-script <file>]")
+		fmt.Fprintln(stderr, "usage: checkpatch (-product <dir> | -product-archive <tar.gz>) -task <id> -p0check <bin> -work <dir> (-patch <file> | -no-patch) [-gen-script <file>] (-runner direct [-script <file>] | -runner docker -image <ref> -modcache <dir> [-build-script <file>])")
 	}
 	flags.StringVar(&opt.product, "product", "", "product repository")
 	flags.StringVar(&opt.archive, "product-archive", "", "product Git archive (.tar.gz)")
@@ -50,7 +55,8 @@ func run(args []string, stderr io.Writer) (record.CheckResult, int) {
 	flags.StringVar(&opt.patch, "patch", "", "patch file")
 	flags.BoolVar(&opt.noPatch, "no-patch", false, "check the baseline without a patch")
 	flags.StringVar(&opt.genScript, "gen-script", "scripts/p0-gen-tree.sh", "generation script")
-	flags.StringVar(&opt.script, "script", "scripts/p0-check-tree.sh", "check script")
+	flags.StringVar(&opt.script, "script", "scripts/p0-check-tree.sh", "direct check script")
+	flags.StringVar(&opt.buildScript, "build-script", "scripts/p0-build-tree.sh", "Docker build script")
 	flags.StringVar(&opt.runner, "runner", "", "required check runner: direct or docker")
 	flags.StringVar(&opt.image, "image", "", "Docker image for the check")
 	flags.StringVar(&opt.modcache, "modcache", "", "populated Go module cache for Docker")
@@ -62,14 +68,16 @@ func run(args []string, stderr io.Writer) (record.CheckResult, int) {
 		return out, 2
 	}
 	if flags.NArg() != 0 || (opt.product == "") == (opt.archive == "") || opt.taskID == "" || opt.p0check == "" ||
-		opt.work == "" || opt.script == "" || opt.genScript == "" || opt.noPatch == (opt.patch != "") ||
+		opt.work == "" || opt.genScript == "" || opt.noPatch == (opt.patch != "") ||
 		(opt.runner != "direct" && opt.runner != "docker") ||
-		(opt.runner == "docker" && (opt.image == "" || strings.HasPrefix(opt.image, "-") || opt.modcache == "")) {
+		(opt.runner == "direct" && opt.script == "") ||
+		(opt.runner == "docker" && (opt.image == "" || strings.HasPrefix(opt.image, "-") || opt.modcache == "" || opt.buildScript == "")) {
 		flags.Usage()
 		out.Error = "invalid arguments"
 		return out, 2
 	}
-	for _, name := range []*string{&opt.product, &opt.work, &opt.p0check, &opt.script, &opt.genScript, &opt.modcache} {
+	out.Runner = opt.runner
+	for _, name := range []*string{&opt.product, &opt.work, &opt.p0check, &opt.script, &opt.genScript, &opt.modcache, &opt.buildScript} {
 		if *name == "" {
 			continue
 		}
@@ -81,14 +89,14 @@ func run(args []string, stderr io.Writer) (record.CheckResult, int) {
 		*name = abs
 	}
 
-	code, err := check(opt, &out)
+	code, err := check(ctx, opt, &out, stderr)
 	if err != nil {
 		out.Error = err.Error()
 	}
 	return out, code
 }
 
-func check(opt options, out *record.CheckResult) (int, error) {
+func check(ctx context.Context, opt options, out *record.CheckResult, stderr io.Writer) (int, error) {
 	task, known := p0.Lookup(opt.taskID)
 	var patch []byte
 	if !opt.noPatch {
@@ -145,7 +153,7 @@ func check(opt options, out *record.CheckResult) (int, error) {
 		}
 	}
 	out.ApplyOK = true
-	return judge(opt, tree, env, out)
+	return judge(ctx, opt, tree, env, out, stderr)
 }
 
 func prepareRepository(opt options) (string, error) {

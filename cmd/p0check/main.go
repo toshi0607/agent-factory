@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"flag"
@@ -32,12 +33,13 @@ func main() {
 	os.Exit(code)
 }
 
-func run(args []string, stderr io.Writer) (result, int) {
+func run(args []string, stderr io.Writer, dialOptions ...grpc.DialOption) (result, int) {
 	flags := flag.NewFlagSet("p0check", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	taskID := flags.String("task", "", "task ID")
 	addr := flags.String("addr", "", "emulator host:port")
 	timeout := flags.Duration("timeout", 30*time.Second, "connection and check timeout")
+	wait := flags.Duration("wait", 0, "separate timeout for retrying the initial connection")
 	out := result{Failures: []record.Failure{}}
 	parseErr := flags.Parse(args)
 	out.Task = *taskID
@@ -45,8 +47,8 @@ func run(args []string, stderr io.Writer) (result, int) {
 		return out, 2
 	}
 	host, port, addrErr := net.SplitHostPort(*addr)
-	if flags.NArg() != 0 || *taskID == "" || addrErr != nil || host == "" || port == "" || *timeout <= 0 {
-		fmt.Fprintln(stderr, "usage: p0check -task <id> -addr <host:port> [-timeout 30s]")
+	if flags.NArg() != 0 || *taskID == "" || addrErr != nil || host == "" || port == "" || *timeout <= 0 || *wait < 0 {
+		fmt.Fprintln(stderr, "usage: p0check -task <id> -addr <host:port> [-timeout 30s] [-wait <duration>]")
 		return out, 2
 	}
 	task, ok := p0.Lookup(*taskID)
@@ -55,10 +57,10 @@ func run(args []string, stderr io.Writer) (result, int) {
 		return out, 2
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
-	conn, err := grpc.NewClient("passthrough:///"+*addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithNoProxy())
+	dialOptions = append([]grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithNoProxy(),
+	}, dialOptions...)
+	conn, err := grpc.NewClient("passthrough:///"+*addr, dialOptions...)
 	if err != nil {
 		fmt.Fprintf(stderr, "create gRPC client for %s: %v\n", *addr, err)
 		return out, 2
@@ -69,12 +71,17 @@ func run(args []string, stderr io.Writer) (result, int) {
 		}
 	}()
 
-	conn.Connect()
-	for state := conn.GetState(); state != connectivity.Ready; state = conn.GetState() {
-		if !conn.WaitForStateChange(ctx, state) {
-			fmt.Fprintf(stderr, "connect to %s: %v (state %s)\n", *addr, ctx.Err(), state)
-			return out, 2
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), cmp.Or(*wait, *timeout))
+	defer cancel()
+	if err := waitForConnection(ctx, conn); err != nil {
+		fmt.Fprintf(stderr, "connect to %s: %v\n", *addr, err)
+		return out, 2
+	}
+	if *wait > 0 {
+		cancel()
+		checkCtx, cancelCheck := context.WithTimeout(context.Background(), *timeout)
+		defer cancelCheck()
+		ctx = checkCtx
 	}
 	for _, failure := range task.Check(ctx, conn) {
 		out.Failures = append(out.Failures, record.Failure{Name: failure.Name, Message: failure.Message})
@@ -84,4 +91,14 @@ func run(args []string, stderr io.Writer) (result, int) {
 		return out, 1
 	}
 	return out, 0
+}
+
+func waitForConnection(ctx context.Context, conn *grpc.ClientConn) error {
+	conn.Connect()
+	for state := conn.GetState(); state != connectivity.Ready; state = conn.GetState() {
+		if !conn.WaitForStateChange(ctx, state) {
+			return fmt.Errorf("%w (state %s)", ctx.Err(), state)
+		}
+	}
+	return nil
 }
